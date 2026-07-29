@@ -473,6 +473,7 @@ class AsyncLLM(EngineClient):
                         **inputs,  # type: ignore[arg-type]
                     )
                     req.external_req_id = request_id
+                    req.streaming_revision = input_chunk.revision
                     if req.prompt_embeds is not None:
                         raise ValueError(
                             "prompt_embeds not supported for streaming inputs"

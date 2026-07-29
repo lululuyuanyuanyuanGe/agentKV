@@ -19,6 +19,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    StreamingRevision,
 )
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
@@ -42,6 +43,7 @@ class StreamingUpdate:
     max_tokens: int
     arrival_time: float
     sampling_params: SamplingParams | None
+    revision: StreamingRevision | None
 
     @classmethod
     def from_request(cls, request: "Request") -> "StreamingUpdate | None":
@@ -53,6 +55,7 @@ class StreamingUpdate:
             max_tokens=request.max_tokens,
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
+            revision=request.streaming_revision,
         )
 
 
@@ -77,6 +80,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        streaming_revision: StreamingRevision | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -183,6 +187,16 @@ class Request:
 
         # Used for streaming
         self.resumable = resumable
+        self.streaming_revision = streaming_revision
+        self.session_version = (
+            streaming_revision.version if streaming_revision is not None else 0
+        )
+        self.commit_frontier = (
+            streaming_revision.commit_frontier if streaming_revision is not None else 0
+        )
+        self.branch_id = (
+            streaming_revision.branch_id if streaming_revision is not None else "main"
+        )
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
@@ -215,6 +229,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            streaming_revision=request.streaming_revision,
         )
 
     def append_output_token_ids(

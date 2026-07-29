@@ -10,8 +10,13 @@ import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import StreamingRevision
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.engine.output_processor import RequestOutputCollector
+from vllm.v1.engine.output_processor import (
+    RequestOutputCollector,
+    RequestState,
+    StreamingUpdate,
+)
 
 
 @pytest.fixture
@@ -104,6 +109,34 @@ def make_output(request_id: str, finished: bool) -> RequestOutput:
         outputs=[],
         finished=finished,
     )
+
+
+def test_output_state_replaces_revision_suffix():
+    state = object.__new__(RequestState)
+    state.streaming_input = True
+    state.prompt = "old prompt"
+    state.prompt_token_ids = [1, 2, 3, 4]
+    state.prompt_len = 4
+    state.stats = None
+    state.is_prefilling = False
+
+    state.apply_streaming_update(
+        StreamingUpdate(
+            prompt="replacement",
+            prompt_token_ids=[8, 9],
+            arrival_time=1.0,
+            revision=StreamingRevision(
+                version=2,
+                base_version=1,
+                replace_from=2,
+            ),
+        )
+    )
+
+    assert state.prompt_token_ids == [1, 2, 8, 9]
+    assert state.prompt is None
+    assert state.prompt_len == 4
+    assert state.is_prefilling
 
 
 @pytest.mark.asyncio

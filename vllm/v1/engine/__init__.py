@@ -32,6 +32,35 @@ FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
 EEP_NOTIFICATION_CALL_ID = -1
 
 
+@dataclass(frozen=True, slots=True)
+class StreamingRevision:
+    """Version metadata for replacing a suffix of a streaming request.
+
+    ``replace_from`` is an absolute token offset in the accumulated prompt.
+    The new streaming chunk replaces every token at or after that offset.
+    ``base_version`` enables optimistic concurrency checks when the producer
+    knows which session version it revised.
+    """
+
+    version: int
+    replace_from: int
+    base_version: int | None = None
+    commit_frontier: int = 0
+    branch_id: str = "main"
+
+    def __post_init__(self) -> None:
+        if self.version < 0:
+            raise ValueError("streaming revision version must be non-negative")
+        if self.replace_from < 0:
+            raise ValueError("streaming revision replace_from must be non-negative")
+        if self.base_version is not None and self.base_version < 0:
+            raise ValueError("streaming revision base_version must be non-negative")
+        if self.commit_frontier < 0:
+            raise ValueError("streaming revision commit_frontier must be non-negative")
+        if not self.branch_id:
+            raise ValueError("streaming revision branch_id must not be empty")
+
+
 class EEPNotificationType(enum.Enum):
     NEW_CORE_ENGINES_INIT_READY = "NEW_CORE_ENGINES_INIT_READY"
     NEW_CORE_ENGINES_WEIGHTS_INIT_READY = "NEW_CORE_ENGINES_WEIGHTS_INIT_READY"
@@ -130,6 +159,9 @@ class EngineCoreRequest(
     # request_finished hook. Used to free P-side prefill blocks when a
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
+
+    # Optional metadata for a versioned streaming suffix replacement.
+    streaming_revision: StreamingRevision | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

@@ -27,7 +27,12 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreRequest,
+    FinishReason,
+    StreamingRevision,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -123,6 +128,7 @@ class StreamingUpdate:
     prompt: str | None
     prompt_token_ids: list[int] | None
     arrival_time: float
+    revision: StreamingRevision | None = None
     final: bool = False
 
 
@@ -191,6 +197,24 @@ class RequestState:
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
+        if update.revision is not None:
+            replace_from = update.revision.replace_from
+            if replace_from > self.prompt_len:
+                raise ValueError(
+                    "streaming revision replace_from exceeds accumulated prompt"
+                )
+            if self.prompt_token_ids is None:
+                raise ValueError("streaming revisions require tokenized prompts")
+            del self.prompt_token_ids[replace_from:]
+            self.prompt_token_ids.extend(update.prompt_token_ids or ())
+            # A token offset cannot be mapped back to a safe character offset.
+            # Avoid returning a misleading concatenated prompt string.
+            self.prompt = None
+            self.prompt_len = len(self.prompt_token_ids)
+            if self.stats is not None:
+                self.stats.arrival_time = update.arrival_time
+            self.is_prefilling = True
+            return
         # TODO also include relevant output tokens in new prompt here
         #     (match scheduler behavior).
         if update.prompt:
@@ -563,6 +587,7 @@ class OutputProcessor:
             prompt=prompt,
             prompt_token_ids=request.prompt_token_ids,
             arrival_time=request.arrival_time,
+            revision=request.streaming_revision,
         )
 
         # Apply request updates now if the last input already completed.
