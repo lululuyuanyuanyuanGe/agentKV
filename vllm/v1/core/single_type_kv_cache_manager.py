@@ -377,6 +377,47 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def free_suffix(self, request_id: str, num_tokens_to_keep: int) -> int:
+        """Release request blocks after a block-aligned token boundary.
+
+        Cached blocks remain discoverable through the prefix cache after the
+        request reference is released. Null padding blocks are bookkeeping
+        entries and do not own storage, so they are only removed from the
+        request's block list.
+
+        Returns:
+            The number of non-null physical blocks released by the request.
+        """
+        if num_tokens_to_keep % self.block_size != 0:
+            raise ValueError("KV suffix rollback must align to the cache block size")
+
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks:
+            return 0
+
+        num_blocks_to_keep = num_tokens_to_keep // self.block_size
+        if num_blocks_to_keep >= len(req_blocks):
+            return 0
+
+        removed_blocks = req_blocks[num_blocks_to_keep:]
+        del req_blocks[num_blocks_to_keep:]
+        physical_blocks = [block for block in removed_blocks if not block.is_null]
+        self.block_pool.free_blocks(reversed(physical_blocks))
+
+        removed_ids = {block.block_id for block in physical_blocks}
+        if removed_ids:
+            self.new_block_ids = [
+                block_id
+                for block_id in self.new_block_ids
+                if block_id not in removed_ids
+            ]
+
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id], num_blocks_to_keep
+            )
+        return len(physical_blocks)
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

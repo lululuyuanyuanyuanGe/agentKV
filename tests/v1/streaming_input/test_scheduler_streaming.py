@@ -4,6 +4,7 @@
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from vllm.config import DeviceConfig, VllmConfig
@@ -14,7 +15,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import FinishReason, StreamingRevision
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -35,6 +36,7 @@ class DummyRequest(Request):
         prompt_token_ids=None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         max_tokens: int | None = 16,
+        revision: StreamingRevision | None = None,
     ):
         super().__init__(
             request_id=request_id,
@@ -45,6 +47,7 @@ class DummyRequest(Request):
             pooling_params=None,
             mm_features=mm_features,
             resumable=resumable,
+            streaming_revision=revision,
         )
 
 
@@ -53,6 +56,7 @@ def create_scheduler() -> Scheduler:
     vllm_config.model_config = MagicMock()
     vllm_config.model_config.skip_tokenizer_init = True
     vllm_config.model_config.is_multimodal_model = False
+    vllm_config.model_config.is_encoder_decoder = False
     vllm_config.model_config.max_model_len = 1024
     vllm_config.model_config.enable_return_routed_experts = False
     vllm_config.cache_config = MagicMock()
@@ -81,6 +85,101 @@ def create_scheduler() -> Scheduler:
 
 
 class TestStreamingScheduler(unittest.TestCase):
+    def test_revision_releases_only_divergent_kv_suffix(self):
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(range(40)),
+            revision=StreamingRevision(
+                version=1,
+                replace_from=0,
+                commit_frontier=16,
+            ),
+        )
+        scheduler.add_request(session)
+
+        allocated = scheduler.kv_cache_manager.allocate_slots(session, 40)
+        assert allocated is not None
+        session.num_computed_tokens = 40
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.num_waiting_for_streaming_input = 1
+        before_ids = scheduler.kv_cache_manager.get_block_ids("session")[0]
+        before_free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        assert len(before_ids) == 3
+
+        revision = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[100, 101, 102],
+            revision=StreamingRevision(
+                version=2,
+                base_version=1,
+                replace_from=20,
+                commit_frontier=16,
+            ),
+        )
+        scheduler.add_request(revision)
+
+        after_ids = scheduler.kv_cache_manager.get_block_ids("session")[0]
+        assert after_ids == before_ids[:1]
+        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == (
+            before_free + 2
+        )
+        assert session.num_computed_tokens == 16
+        assert session.prompt_token_ids == [*range(20), 100, 101, 102]
+        assert session._all_token_ids == session.prompt_token_ids
+        assert session.session_version == 2
+        assert session.commit_frontier == 16
+        assert session.status == RequestStatus.WAITING
+
+        scheduled = scheduler.schedule()
+        assert scheduled.num_scheduled_tokens["session"] == 7
+        assert scheduled.scheduled_new_reqs[0].num_computed_tokens == 16
+        assert scheduled.scheduled_new_reqs[0].block_ids[0][0] == before_ids[0]
+
+    def test_revision_rejects_stale_or_committed_replacement(self):
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(range(32)),
+            revision=StreamingRevision(
+                version=4,
+                replace_from=0,
+                commit_frontier=16,
+            ),
+        )
+        scheduler.add_request(session)
+        session.num_computed_tokens = 32
+
+        stale = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[99],
+            revision=StreamingRevision(
+                version=4,
+                base_version=4,
+                replace_from=20,
+                commit_frontier=16,
+            ),
+        )
+        with pytest.raises(ValueError, match="increase monotonically"):
+            scheduler._update_request_as_session(
+                session, StreamingUpdate.from_request(stale)
+            )
+
+        committed = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[99],
+            revision=StreamingRevision(
+                version=5,
+                base_version=4,
+                replace_from=15,
+                commit_frontier=16,
+            ),
+        )
+        with pytest.raises(ValueError, match="cannot replace committed"):
+            scheduler._update_request_as_session(
+                session, StreamingUpdate.from_request(committed)
+            )
+
     def test_add_request(self):
         scheduler = create_scheduler()
 
@@ -496,7 +595,7 @@ class TestStreamingScheduler(unittest.TestCase):
         eco_cycle2 = eco_dict_cycle2[session.client_index].outputs[0]
         assert eco_cycle2.finish_reason == FinishReason.STOP
         assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-        assert session in scheduler.waiting
+        assert session in scheduler.skipped_waiting
         assert session._all_token_ids == [1, 2, 3, 10, STOP_TOKEN]
 
         # CRITICAL ASSERTION: Cached prompt_token_ids STILL must not have changed

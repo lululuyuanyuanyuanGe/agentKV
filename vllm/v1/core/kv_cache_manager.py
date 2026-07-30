@@ -124,6 +124,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
         self.max_model_len = max_model_len
+        self.scheduler_block_size = scheduler_block_size
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -444,6 +445,26 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+
+    def rollback_request(self, request: Request, replace_from: int) -> tuple[int, int]:
+        """Rollback a request's physical KV suffix.
+
+        The retained token count is rounded down to the scheduler block size.
+        Tokens between that boundary and ``replace_from`` stay in the logical
+        prompt and are recomputed on the next scheduling pass.
+
+        Returns:
+            A pair of retained computed tokens and released physical blocks.
+        """
+        if replace_from < 0 or replace_from > request.num_computed_tokens:
+            raise ValueError("invalid KV suffix rollback token offset")
+        retained_tokens = (
+            replace_from // self.scheduler_block_size * self.scheduler_block_size
+        )
+        released_blocks = self.coordinator.free_suffix(
+            request.request_id, retained_tokens
+        )
+        return retained_tokens, released_blocks
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

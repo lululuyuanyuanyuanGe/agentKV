@@ -1048,6 +1048,10 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
 
+        if update.revision is not None:
+            self._apply_streaming_revision(session, update)
+            return
+
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
@@ -1075,6 +1079,70 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
+
+    def _apply_streaming_revision(
+        self, session: Request, update: StreamingUpdate
+    ) -> None:
+        """Replace a streaming prompt suffix and retain valid physical KV."""
+        revision = update.revision
+        assert revision is not None
+        if revision.base_version is not None and (
+            revision.base_version != session.session_version
+        ):
+            raise ValueError(
+                "streaming revision base_version does not match session version"
+            )
+        if revision.version <= session.session_version:
+            raise ValueError("streaming revision version must increase monotonically")
+        if revision.branch_id != session.branch_id:
+            raise ValueError("streaming revision cannot change branch_id")
+        if session.prompt_token_ids is None or session.prompt_embeds is not None:
+            raise ValueError("streaming revisions require tokenized prompts")
+        if session.mm_features or update.mm_features:
+            raise ValueError("streaming revisions do not support multimodal inputs")
+        if revision.replace_from > session.num_prompt_tokens:
+            raise ValueError(
+                "streaming revision replace_from exceeds accumulated prompt"
+            )
+        if revision.replace_from < session.commit_frontier:
+            raise ValueError("streaming revision cannot replace committed tokens")
+
+        revised_prompt_len = revision.replace_from + len(update.prompt_token_ids or ())
+        if not session.commit_frontier <= revision.commit_frontier:
+            raise ValueError("streaming revision commit_frontier cannot move backward")
+        if revision.commit_frontier > revised_prompt_len:
+            raise ValueError("streaming revision commit_frontier exceeds prompt length")
+
+        rollback_from = min(revision.replace_from, session.num_computed_tokens)
+        retained_tokens, _ = self.kv_cache_manager.rollback_request(
+            session, rollback_from
+        )
+
+        del session.prompt_token_ids[revision.replace_from :]
+        session.prompt_token_ids.extend(update.prompt_token_ids or ())
+        del session._all_token_ids[revision.replace_from :]
+        session._all_token_ids.extend(update.prompt_token_ids or ())
+        session._output_token_ids.clear()
+        session.spec_token_ids.clear()
+        session.num_output_placeholders = 0
+        session.async_tokens_to_discard = 0
+        session.num_computed_tokens = retained_tokens
+        session.num_prompt_tokens = len(session.prompt_token_ids)
+        session.block_hashes.clear()
+        session.update_block_hashes()
+
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        session.max_tokens = update.max_tokens
+        session.streaming_revision = revision
+        session.session_version = revision.version
+        session.commit_frontier = revision.commit_frontier
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
@@ -1814,6 +1882,16 @@ class Scheduler(SchedulerInterface):
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
             if request.resumable:
+                revision = request.streaming_revision
+                if revision is not None:
+                    if revision.replace_from != 0:
+                        raise ValueError(
+                            "the first streaming revision must replace from token 0"
+                        )
+                    if revision.commit_frontier > request.num_prompt_tokens:
+                        raise ValueError(
+                            "streaming revision commit_frontier exceeds prompt length"
+                        )
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request

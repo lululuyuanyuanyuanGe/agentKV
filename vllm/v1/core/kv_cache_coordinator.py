@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -270,6 +271,33 @@ class KVCacheCoordinator(ABC):
         """
         for manager in self.single_type_managers:
             manager.free(request_id)
+
+    def free_suffix(self, request_id: str, num_tokens_to_keep: int) -> int:
+        """Release decoder-cache blocks after an aligned token boundary."""
+        if num_tokens_to_keep % self.scheduler_block_size != 0:
+            raise ValueError(
+                "KV suffix rollback must align to the scheduler block size"
+            )
+
+        unsupported = [
+            type(manager).__name__
+            for manager in self.single_type_managers
+            if not isinstance(manager, (CrossAttentionManager, FullAttentionManager))
+        ]
+        if unsupported:
+            raise ValueError(
+                "KV suffix rollback currently requires full-attention cache groups; "
+                f"unsupported managers: {', '.join(unsupported)}"
+            )
+
+        released_blocks = 0
+        for manager in self.single_type_managers:
+            # Cross-attention cache indexes encoder inputs rather than decoder
+            # token positions and must not be truncated by a text revision.
+            if isinstance(manager, CrossAttentionManager):
+                continue
+            released_blocks += manager.free_suffix(request_id, num_tokens_to_keep)
+        return released_blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
