@@ -41,6 +41,7 @@ from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
+    PartialBlockCopyPlan,
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
@@ -176,6 +177,10 @@ class Scheduler(SchedulerInterface):
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
+
+        # Copy plans stay pending until their newly forked request is actually
+        # scheduled, so worker state and physical KV become visible together.
+        self.pending_partial_block_copies: dict[str, list[PartialBlockCopyPlan]] = {}
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -928,6 +933,11 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+        partial_block_copy_plans = [
+            plan
+            for req_data in new_reqs_data
+            for plan in self.pending_partial_block_copies.pop(req_data.req_id, ())
+        ]
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -945,6 +955,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            partial_block_copy_plans=partial_block_copy_plans,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1399,6 +1410,9 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self.kv_cache_manager.release_partial_block_copy_holds(
+            scheduler_output.partial_block_copy_plans
+        )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1893,12 +1907,70 @@ class Scheduler(SchedulerInterface):
                             "streaming revision commit_frontier exceeds prompt length"
                         )
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
-            self.requests[request.request_id] = request
+            if request.streaming_fork is not None:
+                self._materialize_streaming_fork(request)
+            try:
+                self._enqueue_waiting_request(request)
+                self.requests[request.request_id] = request
+            except Exception:
+                if request.streaming_fork is not None:
+                    plans = self.pending_partial_block_copies.pop(
+                        request.request_id, ()
+                    )
+                    self.kv_cache_manager.release_partial_block_copy_holds(plans)
+                    self.kv_cache_manager.free(request)
+                raise
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def _materialize_streaming_fork(self, request: Request) -> None:
+        """Validate and materialize a branch from resident source KV state."""
+        fork = request.streaming_fork
+        assert fork is not None
+        if self.connector is not None:
+            raise ValueError("streaming forks do not support KV connectors")
+
+        source = self.requests.get(fork.source_request_id)
+        if source is None or source.is_finished():
+            raise ValueError("streaming fork source request is not resident")
+        if fork.source_version is not None and (
+            fork.source_version != source.session_version
+        ):
+            raise ValueError("streaming fork source_version does not match source")
+        if request.streaming_revision is None:
+            raise ValueError("streaming fork requires revision metadata")
+        if request.branch_id == source.branch_id:
+            raise ValueError("streaming fork must use a distinct branch_id")
+        if request.prompt_token_ids is None or request.prompt_embeds is not None:
+            raise ValueError("streaming fork requires tokenized prompts")
+        if source.prompt_token_ids is None or source.prompt_embeds is not None:
+            raise ValueError("streaming fork source must use tokenized prompts")
+        if request.mm_features or source.mm_features:
+            raise ValueError("streaming forks do not support multimodal inputs")
+        if request.lora_request != source.lora_request:
+            raise ValueError("streaming fork source and target must use the same LoRA")
+        if request.cache_salt != source.cache_salt:
+            raise ValueError("streaming fork source and target cache salts differ")
+        if fork.fork_at > source.num_prompt_tokens:
+            raise ValueError("streaming fork exceeds source prompt length")
+        if fork.fork_at > source.num_computed_tokens:
+            raise ValueError("streaming fork exceeds source computed tokens")
+        if fork.fork_at >= request.num_prompt_tokens:
+            raise ValueError("streaming fork target must append a private suffix")
+        if (
+            request.prompt_token_ids[: fork.fork_at]
+            != source.prompt_token_ids[: fork.fork_at]
+        ):
+            raise ValueError("streaming fork target prefix differs from source")
+
+        plans = self.kv_cache_manager.fork_request(
+            source.request_id, request.request_id, fork.fork_at
+        )
+        request.num_computed_tokens = fork.fork_at
+        if plans:
+            self.pending_partial_block_copies[request.request_id] = plans
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -1984,6 +2056,8 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        plans = self.pending_partial_block_copies.pop(request.request_id, ())
+        self.kv_cache_manager.release_partial_block_copy_holds(plans)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 

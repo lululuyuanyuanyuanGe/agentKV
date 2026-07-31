@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.output import PartialBlockCopyPlan
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -465,6 +466,26 @@ class KVCacheManager:
             request.request_id, retained_tokens
         )
         return retained_tokens, released_blocks
+
+    def fork_request(
+        self, source_request_id: str, target_request_id: str, fork_at: int
+    ) -> list[PartialBlockCopyPlan]:
+        """Materialize a branch from resident source KV cache state."""
+        copies = self.coordinator.fork_request(
+            source_request_id, target_request_id, fork_at
+        )
+        return [PartialBlockCopyPlan(*copy) for copy in copies]
+
+    def release_partial_block_copy_holds(
+        self, plans: Sequence[PartialBlockCopyPlan]
+    ) -> None:
+        """Release source and destination pins after GPU copies complete."""
+        blocks = [
+            self.block_pool.blocks[block_id]
+            for plan in plans
+            for block_id in (plan.src_block_id, plan.dst_block_id)
+        ]
+        self.block_pool.free_blocks(blocks)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

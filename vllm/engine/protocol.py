@@ -18,7 +18,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
-from vllm.v1.engine import EngineCoreRequest, StreamingRevision
+from vllm.v1.engine import EngineCoreRequest, StreamingFork, StreamingRevision
 from vllm.v1.engine.input_processor import InputProcessor
 
 if TYPE_CHECKING:
@@ -36,6 +36,7 @@ class StreamingInput:
     prompt: EngineInput
     sampling_params: SamplingParams | None = None
     revision: StreamingRevision | None = None
+    fork: StreamingFork | None = None
 
 
 class EngineClient(ABC):

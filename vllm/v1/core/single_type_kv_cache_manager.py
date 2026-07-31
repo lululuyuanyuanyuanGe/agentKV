@@ -377,6 +377,49 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def fork_request(
+        self, source_request_id: str, target_request_id: str, num_tokens: int
+    ) -> tuple[int, int, int] | None:
+        """Share complete blocks and copy a private partial block for a branch.
+
+        Returns:
+            ``(source_block_id, target_block_id, valid_tokens)`` when the fork
+            ends inside a block, otherwise ``None``.
+        """
+        if target_request_id in self.req_to_blocks:
+            raise ValueError("target request already owns KV cache blocks")
+
+        source_blocks = self.req_to_blocks.get(source_request_id)
+        if source_blocks is None:
+            raise ValueError("source request does not own KV cache blocks")
+
+        num_full_blocks, partial_tokens = divmod(num_tokens, self.block_size)
+        num_source_blocks = num_full_blocks + int(partial_tokens > 0)
+        if len(source_blocks) < num_source_blocks:
+            raise ValueError("source request has insufficient resident KV blocks")
+
+        target_blocks = self.req_to_blocks[target_request_id]
+        shared_blocks = source_blocks[:num_full_blocks]
+        self.block_pool.touch(shared_blocks)
+        target_blocks.extend(shared_blocks)
+        self.num_cached_block[target_request_id] = num_full_blocks
+
+        if partial_tokens == 0:
+            return None
+
+        target_block = self.block_pool.get_new_blocks(1)[0]
+        target_blocks.append(target_block)
+        self.new_block_ids.append(target_block.block_id)
+        # Hold both ends until the worker has completed the copy. This prevents
+        # asynchronous cancellation or source revision from recycling either
+        # block while a queued GPU operation still references its ID.
+        self.block_pool.touch([source_blocks[num_full_blocks], target_block])
+        return (
+            source_blocks[num_full_blocks].block_id,
+            target_block.block_id,
+            partial_tokens,
+        )
+
     def free_suffix(self, request_id: str, num_tokens_to_keep: int) -> int:
         """Release request blocks after a block-aligned token boundary.
 

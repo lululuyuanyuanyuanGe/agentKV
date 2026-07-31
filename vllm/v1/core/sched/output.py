@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -177,6 +177,16 @@ class CachedRequestData:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PartialBlockCopyPlan:
+    """Copy the valid prefix of one physical KV block into another."""
+
+    kv_cache_group_id: int
+    src_block_id: int
+    dst_block_id: int
+    num_tokens: int
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -239,6 +249,9 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Batched GPU copies needed to materialize shared partial branch blocks.
+    partial_block_copy_plans: list[PartialBlockCopyPlan] = field(default_factory=list)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -61,6 +61,28 @@ class StreamingRevision:
             raise ValueError("streaming revision branch_id must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class StreamingFork:
+    """Metadata for materializing a branch from a resident streaming request.
+
+    ``source_request_id`` is resolved to the source request's internal engine
+    identifier by the asynchronous frontend. ``fork_at`` is the number of
+    already-computed source prompt tokens inherited by the new branch.
+    """
+
+    source_request_id: str
+    fork_at: int
+    source_version: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.source_request_id:
+            raise ValueError("streaming fork source_request_id must not be empty")
+        if self.fork_at <= 0:
+            raise ValueError("streaming fork fork_at must be positive")
+        if self.source_version is not None and self.source_version < 0:
+            raise ValueError("streaming fork source_version must be non-negative")
+
+
 class EEPNotificationType(enum.Enum):
     NEW_CORE_ENGINES_INIT_READY = "NEW_CORE_ENGINES_INIT_READY"
     NEW_CORE_ENGINES_WEIGHTS_INIT_READY = "NEW_CORE_ENGINES_WEIGHTS_INIT_READY"
@@ -162,6 +184,9 @@ class EngineCoreRequest(
 
     # Optional metadata for a versioned streaming suffix replacement.
     streaming_revision: StreamingRevision | None = None
+
+    # Optional metadata for inheriting resident KV from another request.
+    streaming_fork: StreamingFork | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

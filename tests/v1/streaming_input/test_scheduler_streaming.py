@@ -14,8 +14,9 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import PartialBlockCopyPlan
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import FinishReason, StreamingRevision
+from vllm.v1.engine import FinishReason, StreamingFork, StreamingRevision
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -37,6 +38,7 @@ class DummyRequest(Request):
         mm_features: list[MultiModalFeatureSpec] | None = None,
         max_tokens: int | None = 16,
         revision: StreamingRevision | None = None,
+        fork: StreamingFork | None = None,
     ):
         super().__init__(
             request_id=request_id,
@@ -48,6 +50,7 @@ class DummyRequest(Request):
             mm_features=mm_features,
             resumable=resumable,
             streaming_revision=revision,
+            streaming_fork=fork,
         )
 
 
@@ -85,6 +88,77 @@ def create_scheduler() -> Scheduler:
 
 
 class TestStreamingScheduler(unittest.TestCase):
+    def test_partial_block_fork_shares_full_block_and_copies_valid_prefix(self):
+        scheduler = create_scheduler()
+        source = DummyRequest(
+            request_id="source",
+            prompt_token_ids=list(range(40)),
+            revision=StreamingRevision(
+                version=7,
+                replace_from=0,
+                commit_frontier=16,
+            ),
+        )
+        scheduler.add_request(source)
+        allocated = scheduler.kv_cache_manager.allocate_slots(source, 40)
+        assert allocated is not None
+        source.num_computed_tokens = 20
+        scheduler.waiting.remove_requests([source])
+        source.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.num_waiting_for_streaming_input = 1
+        source_ids = scheduler.kv_cache_manager.get_block_ids("source")[0]
+        free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+
+        branch = DummyRequest(
+            request_id="branch",
+            prompt_token_ids=[*range(20), 100, 101],
+            revision=StreamingRevision(
+                version=7,
+                replace_from=0,
+                commit_frontier=16,
+                branch_id="analysis",
+            ),
+            fork=StreamingFork(
+                source_request_id="source",
+                source_version=7,
+                fork_at=20,
+            ),
+        )
+        scheduler.add_request(branch)
+
+        branch_ids = scheduler.kv_cache_manager.get_block_ids("branch")[0]
+        assert branch.num_computed_tokens == 20
+        assert branch_ids[0] == source_ids[0]
+        assert branch_ids[1] != source_ids[1]
+        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == (
+            free_before - 1
+        )
+
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens["branch"] == 2
+        assert output.partial_block_copy_plans == [
+            PartialBlockCopyPlan(
+                kv_cache_group_id=0,
+                src_block_id=source_ids[1],
+                dst_block_id=branch_ids[1],
+                num_tokens=4,
+            )
+        ]
+        assert "branch" not in scheduler.pending_partial_block_copies
+        src_partial = scheduler.kv_cache_manager.block_pool.blocks[source_ids[1]]
+        dst_partial = scheduler.kv_cache_manager.block_pool.blocks[branch_ids[1]]
+        assert (src_partial.ref_cnt, dst_partial.ref_cnt) == (2, 2)
+
+        # Abort both requests before the queued worker copy completes. Their
+        # ownership references disappear, but the copy pins keep both block
+        # IDs unavailable for reuse until the model step returns.
+        scheduler.finish_requests(["source", "branch"], RequestStatus.FINISHED_ABORTED)
+        assert (src_partial.ref_cnt, dst_partial.ref_cnt) == (1, 1)
+        scheduler.kv_cache_manager.release_partial_block_copy_holds(
+            output.partial_block_copy_plans
+        )
+        assert (src_partial.ref_cnt, dst_partial.ref_cnt) == (0, 0)
+
     def test_revision_releases_only_divergent_kv_suffix(self):
         scheduler = create_scheduler()
         session = DummyRequest(

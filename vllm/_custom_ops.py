@@ -2832,6 +2832,25 @@ def swap_blocks_batch(
         )
 
 
+def batched_partial_block_copy(
+    cache: torch.Tensor,
+    segment_addresses: torch.Tensor,
+    copy_mapping: torch.Tensor,
+    page_stride_bytes: int,
+    token_stride_bytes: int,
+    block_size: int,
+) -> None:
+    """Copy valid prefixes for a batch of partial KV cache blocks."""
+    torch.ops._C_cache_ops.batched_partial_block_copy(
+        cache,
+        segment_addresses,
+        copy_mapping,
+        page_stride_bytes,
+        token_stride_bytes,
+        block_size,
+    )
+
+
 def convert_fp8(
     output: torch.Tensor, input: torch.Tensor, scale: float = 1.0, kv_dtype: str = "fp8"
 ) -> None:

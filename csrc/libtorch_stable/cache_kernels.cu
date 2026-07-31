@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdint>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -177,6 +178,99 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                       stream);
     }
   }
+}
+
+namespace vllm {
+
+__global__ void batched_partial_block_copy_kernel(
+    const int64_t* __restrict__ segment_addresses,
+    const int64_t* __restrict__ copy_mapping, int64_t num_segments,
+    int64_t num_copies, int64_t page_stride_bytes, int64_t token_stride_bytes,
+    int64_t block_size) {
+  const int64_t work_idx = blockIdx.x;
+  const int64_t copy_idx = work_idx / num_segments;
+  if (copy_idx >= num_copies) return;
+
+  const int64_t segment_idx = work_idx % num_segments;
+  const int64_t src_block = copy_mapping[copy_idx * 3];
+  const int64_t dst_block = copy_mapping[copy_idx * 3 + 1];
+  const int64_t valid_tokens = copy_mapping[copy_idx * 3 + 2];
+  if (src_block < 0 || dst_block < 0 || valid_tokens <= 0 ||
+      valid_tokens >= block_size) {
+    return;
+  }
+
+  const auto segment_base =
+      static_cast<uint64_t>(segment_addresses[segment_idx]);
+  const auto src_address =
+      segment_base + static_cast<uint64_t>(src_block * page_stride_bytes);
+  const auto dst_address =
+      segment_base + static_cast<uint64_t>(dst_block * page_stride_bytes);
+  const int64_t num_bytes = valid_tokens * token_stride_bytes;
+
+  auto* src = reinterpret_cast<const uint8_t*>(src_address);
+  auto* dst = reinterpret_cast<uint8_t*>(dst_address);
+  const bool aligned = ((src_address | dst_address | num_bytes) & 0xF) == 0;
+  if (aligned) {
+    const auto* src_vec = reinterpret_cast<const uint4*>(src);
+    auto* dst_vec = reinterpret_cast<uint4*>(dst);
+    const int64_t num_vecs = num_bytes / sizeof(uint4);
+    for (int64_t i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+      dst_vec[i] = src_vec[i];
+    }
+  } else {
+    for (int64_t i = threadIdx.x; i < num_bytes; i += blockDim.x) {
+      dst[i] = src[i];
+    }
+  }
+}
+
+}  // namespace vllm
+
+void batched_partial_block_copy(torch::stable::Tensor& cache,
+                                const torch::stable::Tensor& segment_addresses,
+                                const torch::stable::Tensor& copy_mapping,
+                                int64_t page_stride_bytes,
+                                int64_t token_stride_bytes,
+                                int64_t block_size) {
+  STD_TORCH_CHECK(cache.device().is_cuda(), "cache must be on a GPU");
+  STD_TORCH_CHECK(segment_addresses.device() == cache.device(),
+                  "segment_addresses must be on the cache device");
+  STD_TORCH_CHECK(copy_mapping.device() == cache.device(),
+                  "copy_mapping must be on the cache device");
+  STD_TORCH_CHECK(
+      segment_addresses.scalar_type() == torch::headeronly::ScalarType::Long,
+      "segment_addresses must be int64");
+  STD_TORCH_CHECK(
+      copy_mapping.scalar_type() == torch::headeronly::ScalarType::Long,
+      "copy_mapping must be int64");
+  STD_TORCH_CHECK(segment_addresses.is_contiguous(),
+                  "segment_addresses must be contiguous");
+  STD_TORCH_CHECK(segment_addresses.dim() == 1,
+                  "segment_addresses must be one-dimensional");
+  STD_TORCH_CHECK(copy_mapping.is_contiguous(),
+                  "copy_mapping must be contiguous");
+  STD_TORCH_CHECK(copy_mapping.dim() == 2 && copy_mapping.size(1) == 3,
+                  "copy_mapping must have shape [num_copies, 3]");
+  STD_TORCH_CHECK(page_stride_bytes > 0 && token_stride_bytes > 0,
+                  "copy strides must be positive");
+  STD_TORCH_CHECK(block_size > 1, "block_size must be greater than one");
+
+  const int64_t num_segments = segment_addresses.numel();
+  const int64_t num_copies = copy_mapping.size(0);
+  if (num_segments == 0 || num_copies == 0) return;
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      cache.device().index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  constexpr int threads = 256;
+  const int64_t num_work_items = num_segments * num_copies;
+  vllm::
+      batched_partial_block_copy_kernel<<<num_work_items, threads, 0, stream>>>(
+          segment_addresses.const_data_ptr<int64_t>(),
+          copy_mapping.const_data_ptr<int64_t>(), num_segments, num_copies,
+          page_stride_bytes, token_stride_bytes, block_size);
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 namespace vllm {

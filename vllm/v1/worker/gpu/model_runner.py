@@ -108,7 +108,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.utils import BatchedPartialBlockCopyManager, KVBlockZeroer
 
 logger = init_logger(__name__)
 
@@ -138,6 +138,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
+        self.partial_block_copier: BatchedPartialBlockCopyManager | None = None
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -487,6 +488,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
         )
+        self.partial_block_copier = BatchedPartialBlockCopyManager(
+            self.device,
+            is_pin_memory_available(),
+            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+            kernel_block_sizes=self.kernel_block_sizes,
+            cache_dtype=self.cache_config.cache_dtype,
+            static_forward_context=self.compilation_config.static_forward_context,
+        )
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -812,6 +821,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.partial_block_copy_plans:
+            assert self.partial_block_copier is not None
+            self.partial_block_copier.copy(scheduler_output.partial_block_copy_plans)
 
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor

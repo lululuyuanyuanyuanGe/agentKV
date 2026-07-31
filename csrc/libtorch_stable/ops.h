@@ -463,6 +463,12 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& sizes,
                        bool is_src_access_order_any);
 
+void batched_partial_block_copy(torch::stable::Tensor& cache,
+                                const torch::stable::Tensor& segment_addresses,
+                                const torch::stable::Tensor& copy_mapping,
+                                int64_t page_stride_bytes,
+                                int64_t token_stride_bytes, int64_t block_size);
+
 void reshape_and_cache(torch::stable::Tensor& key, torch::stable::Tensor& value,
                        torch::stable::Tensor& key_cache,
                        torch::stable::Tensor& value_cache,

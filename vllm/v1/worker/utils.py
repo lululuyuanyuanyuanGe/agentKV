@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -23,6 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
+from vllm.v1.core.sched.output import PartialBlockCopyPlan
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -217,6 +219,180 @@ class KVBlockZeroer:
             PAGE_SIZE_EL=page_size_el,
             BLOCK_SIZE=blk_size,
         )
+
+
+@dataclass
+class _PartialCopyLayout:
+    cache: torch.Tensor
+    segment_addresses: torch.Tensor
+    page_stride_bytes: int
+    token_stride_bytes: int
+    block_size: int
+
+
+@dataclass
+class _PartialCopyBuffers:
+    capacity: int
+    host: torch.Tensor
+    device: torch.Tensor
+
+
+class BatchedPartialBlockCopyManager:
+    """Build layout metadata and execute batched partial-block COW copies."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        pin_memory: bool,
+        attn_groups_iter: Iterable["AttentionGroup"],
+        kernel_block_sizes: list[int],
+        cache_dtype: str,
+        static_forward_context: dict[str, Any],
+        runner_only_attn_layers: set[str] | None = None,
+    ) -> None:
+        self.device = device
+        self.pin_memory = pin_memory
+        self._layouts: dict[int, list[_PartialCopyLayout]] = defaultdict(list)
+        self._buffers: dict[int, _PartialCopyBuffers] = {}
+        runner_only_attn_layers = runner_only_attn_layers or set()
+
+        layouts: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+        seen_ptrs: set[tuple[int, int]] = set()
+        for group in attn_groups_iter:
+            spec = group.kv_cache_spec
+            group_id = group.kv_cache_group_id
+            if not isinstance(spec, FullAttentionSpec):
+                continue
+            if spec.kv_quant_mode.is_per_token_head or spec.kv_quant_mode.is_nvfp4:
+                continue
+            if group_id >= len(kernel_block_sizes):
+                continue
+
+            kernel_block_size = kernel_block_sizes[group_id]
+            if spec.block_size % kernel_block_size != 0:
+                continue
+            ratio = spec.block_size // kernel_block_size
+            block_dim = group.backend.get_kv_cache_block_dim(
+                kernel_block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                cache_dtype_str=cache_dtype,
+            )
+
+            for layer_name in group.layer_names:
+                if layer_name in runner_only_attn_layers:
+                    continue
+                kv = static_forward_context[layer_name].kv_cache
+                if not isinstance(kv, torch.Tensor):
+                    continue
+                pointer_key = (group_id, kv.data_ptr())
+                if pointer_key in seen_ptrs:
+                    continue
+                seen_ptrs.add(pointer_key)
+
+                token_dims = [
+                    dim
+                    for dim, size in enumerate(kv.shape)
+                    if dim != block_dim and size == kernel_block_size
+                ]
+                if len(token_dims) != 1:
+                    raise ValueError(
+                        "partial-block COW cannot identify the KV token dimension "
+                        f"for layer {layer_name}: shape={tuple(kv.shape)}"
+                    )
+                token_dim = token_dims[0]
+                element_size = kv.element_size()
+                token_stride_bytes = kv.stride(token_dim) * element_size
+                page_stride_bytes = kv.stride(block_dim) * element_size * ratio
+                segment_dims = [
+                    dim
+                    for dim in range(kv.dim())
+                    if dim not in (block_dim, token_dim)
+                    and kv.stride(dim) * element_size > token_stride_bytes
+                ]
+                offsets = [
+                    sum(
+                        index * kv.stride(dim) * element_size
+                        for index, dim in zip(indices, segment_dims)
+                    )
+                    for indices in iprod(
+                        *(range(kv.shape[dim]) for dim in segment_dims)
+                    )
+                ]
+                copied_page_bytes = len(offsets) * token_stride_bytes * spec.block_size
+                if copied_page_bytes != spec.real_page_size_bytes:
+                    raise ValueError(
+                        "partial-block COW requires a token-segmented KV layout; "
+                        f"layer {layer_name} exposes {copied_page_bytes} bytes "
+                        f"but the cache spec requires {spec.real_page_size_bytes}"
+                    )
+
+                layout_key = (
+                    group_id,
+                    page_stride_bytes,
+                    token_stride_bytes,
+                    spec.block_size,
+                )
+                layout = layouts.setdefault(layout_key, {"cache": kv, "addresses": []})
+                layout["addresses"].extend(kv.data_ptr() + offset for offset in offsets)
+
+        for key, layout in layouts.items():
+            group_id, page_stride_bytes, token_stride_bytes, block_size = key
+            self._layouts[group_id].append(
+                _PartialCopyLayout(
+                    cache=layout["cache"],
+                    segment_addresses=torch.tensor(
+                        layout["addresses"], dtype=torch.int64, device=self.device
+                    ),
+                    page_stride_bytes=page_stride_bytes,
+                    token_stride_bytes=token_stride_bytes,
+                    block_size=block_size,
+                )
+            )
+
+    def _get_buffers(self, group_id: int, count: int) -> _PartialCopyBuffers:
+        buffers = self._buffers.get(group_id)
+        if buffers is not None and buffers.capacity >= count:
+            return buffers
+        capacity = max(count * 2, 64)
+        buffers = _PartialCopyBuffers(
+            capacity=capacity,
+            host=torch.empty(
+                (capacity, 3), dtype=torch.int64, pin_memory=self.pin_memory
+            ),
+            device=torch.empty((capacity, 3), dtype=torch.int64, device=self.device),
+        )
+        self._buffers[group_id] = buffers
+        return buffers
+
+    def copy(self, plans: list[PartialBlockCopyPlan]) -> None:
+        """Copy all branch prefixes, batching sessions within each cache group."""
+        grouped: dict[int, list[PartialBlockCopyPlan]] = defaultdict(list)
+        for plan in plans:
+            grouped[plan.kv_cache_group_id].append(plan)
+
+        for group_id, group_plans in grouped.items():
+            layouts = self._layouts.get(group_id)
+            if not layouts:
+                raise ValueError(
+                    f"partial-block COW has no supported layout for group {group_id}"
+                )
+            buffers = self._get_buffers(group_id, len(group_plans))
+            buffers.host[: len(group_plans)].numpy()[:] = [
+                (plan.src_block_id, plan.dst_block_id, plan.num_tokens)
+                for plan in group_plans
+            ]
+            mapping = buffers.device[: len(group_plans)]
+            mapping.copy_(buffers.host[: len(group_plans)], non_blocking=True)
+            for layout in layouts:
+                ops.batched_partial_block_copy(
+                    layout.cache,
+                    layout.segment_addresses,
+                    mapping,
+                    layout.page_stride_bytes,
+                    layout.token_stride_bytes,
+                    layout.block_size,
+                )
 
 
 @dataclass

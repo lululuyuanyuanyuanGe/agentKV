@@ -730,6 +730,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                  Tensor sizes,"
       "                  bool is_src_access_order_any=False) -> ()");
 
+  // Copy valid token prefixes from shared source blocks into private blocks.
+  ops.def(
+      "batched_partial_block_copy(Tensor! cache, Tensor segment_addresses,"
+      "                           Tensor copy_mapping,"
+      "                           int page_stride_bytes,"
+      "                           int token_stride_bytes,"
+      "                           int block_size) -> ()");
+
   // Reshape the key and value tensors and cache them.
   ops.def(
       "reshape_and_cache(Tensor key, Tensor value,"
@@ -850,6 +858,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CPU, ops) {
 
 STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("swap_blocks", TORCH_BOX(&swap_blocks));
+  ops.impl("batched_partial_block_copy",
+           TORCH_BOX(&batched_partial_block_copy));
   ops.impl("reshape_and_cache", TORCH_BOX(&reshape_and_cache));
   ops.impl("reshape_and_cache_flash", TORCH_BOX(&reshape_and_cache_flash));
   ops.impl("concat_and_cache_mla", TORCH_BOX(&concat_and_cache_mla));

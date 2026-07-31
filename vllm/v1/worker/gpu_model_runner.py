@@ -216,6 +216,7 @@ from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
     AttentionGroup,
+    BatchedPartialBlockCopyManager,
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
@@ -525,6 +526,7 @@ class GPUModelRunner(
         self.kv_caches: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
+        self._partial_block_copier: BatchedPartialBlockCopyManager | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
@@ -1099,6 +1101,15 @@ class GPUModelRunner(
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
         )
+        self._partial_block_copier = BatchedPartialBlockCopyManager(
+            self.device,
+            self.pin_memory,
+            attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
+            kernel_block_sizes=self._kernel_block_sizes,
+            cache_dtype=self.cache_config.cache_dtype,
+            runner_only_attn_layers=self.runner_only_attn_layers,
+            static_forward_context=self.compilation_config.static_forward_context,
+        )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
@@ -1152,6 +1163,9 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.partial_block_copy_plans:
+            assert self._partial_block_copier is not None
+            self._partial_block_copier.copy(scheduler_output.partial_block_copy_plans)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:

@@ -7,6 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -141,6 +142,7 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
         )
+        self._streaming_internal_req_ids: dict[str, str] = {}
 
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
@@ -452,6 +454,7 @@ class AsyncLLM(EngineClient):
         )
         self.input_processor.assign_request_id(final_req)
         internal_req_id = final_req.request_id
+        self._streaming_internal_req_ids[request_id] = internal_req_id
 
         queue = RequestOutputCollector(sampling_params.output_kind, internal_req_id)
 
@@ -474,6 +477,17 @@ class AsyncLLM(EngineClient):
                     )
                     req.external_req_id = request_id
                     req.streaming_revision = input_chunk.revision
+                    if input_chunk.fork is not None:
+                        source_id = self._streaming_internal_req_ids.get(
+                            input_chunk.fork.source_request_id
+                        )
+                        if source_id is None:
+                            raise ValueError(
+                                "streaming fork source is not an active input stream"
+                            )
+                        req.streaming_fork = replace(
+                            input_chunk.fork, source_request_id=source_id
+                        )
                     if req.prompt_embeds is not None:
                         raise ValueError(
                             "prompt_embeds not supported for streaming inputs"
@@ -490,10 +504,17 @@ class AsyncLLM(EngineClient):
                 queue.put(InputStreamError(error))
             finally:
                 queue._input_stream_task = None
-                if not cancelled:
-                    # Send empty final request to indicate that inputs have
-                    # finished. Don't send if cancelled (session was aborted).
-                    await self._add_request(final_req, None, None, 0, queue)
+                try:
+                    if not cancelled:
+                        # Send empty final request to indicate that inputs have
+                        # finished. Don't send if cancelled (session was aborted).
+                        await self._add_request(final_req, None, None, 0, queue)
+                finally:
+                    if (
+                        self._streaming_internal_req_ids.get(request_id)
+                        == internal_req_id
+                    ):
+                        del self._streaming_internal_req_ids[request_id]
 
         # Ensure output handler is running.
         self._run_output_handler()

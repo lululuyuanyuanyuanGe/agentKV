@@ -19,6 +19,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    StreamingFork,
     StreamingRevision,
 )
 from vllm.v1.metrics.stats import PrefillStats
@@ -81,6 +82,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         streaming_revision: StreamingRevision | None = None,
+        streaming_fork: StreamingFork | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -188,6 +190,7 @@ class Request:
         # Used for streaming
         self.resumable = resumable
         self.streaming_revision = streaming_revision
+        self.streaming_fork = streaming_fork
         self.session_version = (
             streaming_revision.version if streaming_revision is not None else 0
         )
@@ -230,6 +233,7 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             streaming_revision=request.streaming_revision,
+            streaming_fork=request.streaming_fork,
         )
 
     def append_output_token_ids(

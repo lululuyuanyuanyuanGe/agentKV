@@ -580,12 +580,9 @@ class Worker(WorkerBase):
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
-        # Build KV-zero metadata outside the CuMem pool so the bookkeeping
-        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
-        # allocator and are not discarded during sleep/wake cycles.
-        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
-            self.model_runner, "_init_kv_zero_meta"
-        ):
+        # Build KV mutation metadata outside the CuMem pool so the bookkeeping
+        # tensors for zeroing and partial-block COW survive sleep/wake cycles.
+        if hasattr(self.model_runner, "_init_kv_zero_meta"):
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")

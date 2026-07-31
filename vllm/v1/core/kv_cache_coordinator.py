@@ -299,6 +299,56 @@ class KVCacheCoordinator(ABC):
             released_blocks += manager.free_suffix(request_id, num_tokens_to_keep)
         return released_blocks
 
+    def fork_request(
+        self, source_request_id: str, target_request_id: str, num_tokens: int
+    ) -> list[tuple[int, int, int, int]]:
+        """Materialize a branch with shared full blocks and private partials.
+
+        Returns:
+            Tuples of ``(group_id, source_block, target_block, valid_tokens)``.
+        """
+        unsupported = [
+            type(manager).__name__
+            for manager in self.single_type_managers
+            if not isinstance(manager, FullAttentionManager)
+        ]
+        if unsupported:
+            raise ValueError(
+                "partial-block COW requires full-attention cache groups; "
+                f"unsupported managers: {', '.join(unsupported)}"
+            )
+
+        required_blocks = sum(
+            num_tokens % manager.block_size != 0
+            for manager in self.single_type_managers
+        )
+        if required_blocks > self.block_pool.get_num_free_blocks():
+            raise ValueError("insufficient free KV blocks to materialize branch")
+
+        copies: list[tuple[int, int, int, int]] = []
+        materialized: list[SingleTypeKVCacheManager] = []
+        try:
+            for manager in self.single_type_managers:
+                # Register before mutation so a failure inside this manager is
+                # also covered by the transactional cleanup below.
+                materialized.append(manager)
+                copy = manager.fork_request(
+                    source_request_id, target_request_id, num_tokens
+                )
+                if copy is not None:
+                    copies.append((manager.kv_cache_group_id, *copy))
+        except Exception:
+            held_blocks = [
+                self.block_pool.blocks[block_id]
+                for _, src_block_id, dst_block_id, _ in copies
+                for block_id in (src_block_id, dst_block_id)
+            ]
+            self.block_pool.free_blocks(held_blocks)
+            for manager in reversed(materialized):
+                manager.free(target_request_id)
+            raise
+        return copies
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated
