@@ -38,6 +38,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
+from vllm.v1.agent_kv.protocol import AgentKVEvent, AgentKVRequestMetadata
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -298,6 +299,7 @@ class AsyncLLM(EngineClient):
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -333,6 +335,7 @@ class AsyncLLM(EngineClient):
                 priority,
                 data_parallel_rank,
                 session_id,
+                agent_kv_metadata,
             )
 
         # Convert Input --> Request.
@@ -365,6 +368,7 @@ class AsyncLLM(EngineClient):
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    agent_kv_metadata=agent_kv_metadata,
                 )
             else:
                 # Raw prompts require tokenization and possibly multimodal
@@ -381,6 +385,7 @@ class AsyncLLM(EngineClient):
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    agent_kv_metadata=agent_kv_metadata,
                 )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -450,6 +455,7 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> RequestOutputCollector:
         self._validate_streaming_input_sampling_params(sampling_params)
 
@@ -462,6 +468,7 @@ class AsyncLLM(EngineClient):
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             session_id=session_id,
+            agent_kv_metadata=agent_kv_metadata,
         )
 
         if not sampling_params.skip_clone:
@@ -565,6 +572,7 @@ class AsyncLLM(EngineClient):
         session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -593,6 +601,7 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
                 session_id=session_id,
+                agent_kv_metadata=agent_kv_metadata,
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
@@ -955,6 +964,9 @@ class AsyncLLM(EngineClient):
 
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
+
+    async def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        return await self.engine_core.apply_agent_kv_event_async(event)
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:

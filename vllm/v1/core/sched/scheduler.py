@@ -31,6 +31,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.agent_kv.controller import AgentKVController
+from vllm.v1.agent_kv.protocol import AgentKVEvent
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -87,6 +89,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
+        self.agent_kv_controller = AgentKVController()
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -2238,6 +2241,10 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if request.agent_kv_metadata is not None:
+                self.agent_kv_controller.register_request(
+                    request.agent_kv_metadata, request.request_id
+                )
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -2312,6 +2319,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self.agent_kv_controller.finish_request(
+            request.request_id, request.block_hashes
+        )
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2428,6 +2438,10 @@ class Scheduler(SchedulerInterface):
                 and self.ec_connector.has_pending_push_work()
             )
         )
+
+    def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        """Record lifecycle metadata without changing cache behavior."""
+        return self.agent_kv_controller.apply_event(event)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

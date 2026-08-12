@@ -28,6 +28,7 @@ from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
 from vllm.usage.usage_lib import UsageContext
+from vllm.v1.agent_kv.protocol import AgentKVEvent, AgentKVRequestMetadata
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
@@ -227,6 +228,7 @@ class LLMEngine:
         priority: int = 0,
         session_id: str | None = None,
         prompt_text: str | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> str:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -259,6 +261,7 @@ class LLMEngine:
                 trace_headers=trace_headers,
                 priority=priority,
                 session_id=session_id,
+                agent_kv_metadata=agent_kv_metadata,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -359,6 +362,9 @@ class LLMEngine:
         stale vision embeddings computed with old weights are not reused.
         """
         self.engine_core.reset_encoder_cache()
+
+    def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        return self.engine_core.apply_agent_kv_event(event)
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         if level >= 1:

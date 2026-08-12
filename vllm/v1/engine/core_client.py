@@ -34,6 +34,7 @@ from vllm.utils.network_utils import (
     get_open_zmq_inproc_path,
     make_zmq_socket,
 )
+from vllm.v1.agent_kv.protocol import AgentKVEvent
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     FT_STATUS_CALL_ID,
@@ -164,6 +165,9 @@ class EngineCoreClient(ABC):
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
+    def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -254,6 +258,11 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def apply_agent_kv_event_async(
+        self, event: AgentKVEvent
+    ) -> dict[str, object]:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -350,6 +359,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        return self.engine_core.apply_agent_kv_event(event)
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -929,6 +941,9 @@ class SyncMPClient(MPClient):
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
+    def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        return self.call_utility("apply_agent_kv_event", event)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1182,6 +1197,11 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
+
+    async def apply_agent_kv_event_async(
+        self, event: AgentKVEvent
+    ) -> dict[str, object]:
+        return await self.call_utility_async("apply_agent_kv_event", event)
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)

@@ -15,6 +15,7 @@ from vllm.renderers import BaseRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 from vllm.utils.async_utils import collect_from_async_generator
+from vllm.v1.agent_kv.protocol import AgentKVRequestMetadata
 
 from .utils import BeamSearchSequence, create_sort_beams_key_function
 
@@ -33,6 +34,7 @@ class BeamSearchOnlineMixin(ABC):
         lora_request: LoRARequest | None = None,
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens
@@ -92,6 +94,7 @@ class BeamSearchOnlineMixin(ABC):
                             lora_request=lora_request_item,
                             trace_headers=trace_headers,
                             session_id=session_id,
+                            agent_kv_metadata=agent_kv_metadata,
                         )
                     )
                 )

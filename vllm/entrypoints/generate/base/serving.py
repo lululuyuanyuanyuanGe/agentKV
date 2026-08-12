@@ -12,6 +12,7 @@ from pydantic import ConfigDict
 from starlette.datastructures import Headers
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.generate.base.agent_kv import get_agent_kv_request_metadata
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
@@ -25,6 +26,7 @@ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.engine.typing import AnyRequest
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
@@ -35,6 +37,7 @@ from vllm.tracing import (
     extract_trace_headers,
     log_tracing_disabled_warning,
 )
+from vllm.v1.agent_kv.protocol import AgentKVRequestMetadata
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -239,6 +242,22 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             if isinstance(session_id, str) and session_id:
                 return session_id
         return None
+
+    @staticmethod
+    def _get_agent_kv_metadata(
+        request: ChatCompletionRequest | CompletionRequest | ResponsesRequest,
+        raw_request: Request | None,
+        session_id: str | None = None,
+    ) -> AgentKVRequestMetadata | None:
+        try:
+            return get_agent_kv_request_metadata(
+                session_id=session_id
+                or GenerateBaseServing._get_session_id(request, raw_request),
+                headers=raw_request.headers if raw_request is not None else None,
+                xargs=request.vllm_xargs,
+            )
+        except ValueError as exc:
+            raise VLLMValidationError(str(exc)) from exc
 
     @staticmethod
     def _get_priority(

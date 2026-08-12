@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm import SamplingParams
+from vllm.v1.agent_kv.protocol import AgentKVRequestMetadata
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.request import Request, RequestStatus
 
@@ -24,6 +27,11 @@ def test_request_status_fmt_str():
 
 
 def test_request_copies_session_id_from_engine_core_request():
+    agent_kv_metadata = AgentKVRequestMetadata(
+        namespace="tenant-1",
+        session_id="session-1",
+        generation=3,
+    )
     engine_request = EngineCoreRequest(
         request_id="request-1",
         prompt_token_ids=[1, 2, 3],
@@ -35,8 +43,28 @@ def test_request_copies_session_id_from_engine_core_request():
         cache_salt=None,
         data_parallel_rank=None,
         session_id="session-1",
+        agent_kv_metadata=agent_kv_metadata,
     )
 
     request = Request.from_engine_core_request(engine_request, block_hasher=None)
 
     assert request.session_id == "session-1"
+    assert request.agent_kv_metadata == agent_kv_metadata
+
+
+def test_request_rejects_mismatched_agent_kv_session_id():
+    metadata = AgentKVRequestMetadata(
+        namespace="tenant-1",
+        session_id="session-1",
+        generation=3,
+    )
+
+    with pytest.raises(ValueError, match="session_id must match"):
+        Request(
+            request_id="request-1",
+            prompt_token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            session_id="different-session",
+            agent_kv_metadata=metadata,
+        )

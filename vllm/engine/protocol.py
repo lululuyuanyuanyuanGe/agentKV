@@ -18,6 +18,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
+from vllm.v1.agent_kv.protocol import AgentKVEvent, AgentKVRequestMetadata
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
@@ -81,8 +82,14 @@ class EngineClient(ABC):
         session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
+        ...
+
+    @abstractmethod
+    async def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        """Apply an upstream AgentKV lifecycle event."""
         ...
 
     @abstractmethod
