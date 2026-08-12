@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
+
 from vllm.v1.agent_kv.controller import AgentKVController
+from vllm.v1.agent_kv.policy import AgentKVEvictionClass
 from vllm.v1.agent_kv.protocol import (
     AgentKVEvent,
     AgentKVEventHints,
@@ -12,10 +15,39 @@ from vllm.v1.agent_kv.protocol import (
 )
 
 
-def make_metadata(generation: int) -> AgentKVRequestMetadata:
+@dataclass(frozen=True)
+class _Candidate:
+    block_id: int
+    cache_keys: tuple[bytes, ...]
+    content_hashes: tuple[bytes, ...]
+
+
+def make_metadata(
+    generation: int,
+    session_id: str = "session-a",
+) -> AgentKVRequestMetadata:
     return AgentKVRequestMetadata(
         namespace="tenant-a",
-        session_id="session-a",
+        session_id=session_id,
+        branch_id="main",
+        generation=generation,
+    )
+
+
+def make_event_for_session(
+    event_id: str,
+    sequence: int,
+    event_type: AgentKVEventType,
+    generation: int,
+    session_id: str = "session-a",
+) -> AgentKVEvent:
+    return AgentKVEvent(
+        event_id=event_id,
+        event_sequence=sequence,
+        event_type=event_type,
+        emitted_at_ms=1_000 + sequence,
+        namespace="tenant-a",
+        session_id=session_id,
         branch_id="main",
         generation=generation,
     )
@@ -27,16 +59,7 @@ def make_event(
     event_type: AgentKVEventType,
     generation: int,
 ) -> AgentKVEvent:
-    return AgentKVEvent(
-        event_id=event_id,
-        event_sequence=sequence,
-        event_type=event_type,
-        emitted_at_ms=1_000 + sequence,
-        namespace="tenant-a",
-        session_id="session-a",
-        branch_id="main",
-        generation=generation,
-    )
+    return make_event_for_session(event_id, sequence, event_type, generation)
 
 
 def test_request_registration_and_finish_capture_content_hashes() -> None:
@@ -146,3 +169,103 @@ def test_business_hints_are_retained_for_policy_evaluation() -> None:
     assert snapshot is not None
     assert snapshot["priority"] == 3
     assert snapshot["expected_resume_in_ms"] == 10_000
+
+
+def test_content_hash_ownership_accumulates_across_finished_requests() -> None:
+    controller = AgentKVController()
+    metadata = make_metadata(7)
+    controller.register_request(metadata, "request-1")
+    controller.finish_request("request-1", [b"prefix"])
+    controller.register_request(metadata, "request-2")
+    controller.finish_request("request-2", [b"prefix", b"continuation"])
+
+    owners = controller.get_block_owners(b"prefix")
+    continuation_owners = controller.get_block_owners(b"continuation")
+
+    assert len(owners) == 1
+    assert owners == continuation_owners
+
+
+def test_shared_hash_tracks_each_session_owner() -> None:
+    controller = AgentKVController()
+    controller.register_request(make_metadata(1, "session-a"), "request-a")
+    controller.register_request(make_metadata(1, "session-b"), "request-b")
+    controller.finish_request("request-a", [b"shared"])
+    controller.finish_request("request-b", [b"shared"])
+
+    owners = controller.get_block_owners(b"shared")
+
+    assert {owner.session_id for owner in owners} == {"session-a", "session-b"}
+
+
+def test_shared_hash_remains_protected_by_live_owner_after_other_terminates() -> None:
+    controller = AgentKVController()
+    controller.register_request(make_metadata(1, "terminated"), "request-terminated")
+    controller.register_request(make_metadata(1, "live"), "request-live")
+    controller.finish_request("request-terminated", [b"shared"])
+    controller.finish_request("request-live", [b"shared"])
+    controller.apply_event(
+        make_event_for_session(
+            "terminate",
+            1,
+            AgentKVEventType.SESSION_TERMINATED,
+            1,
+            "terminated",
+        )
+    )
+    controller.apply_event(
+        make_event_for_session(
+            "resume",
+            1,
+            AgentKVEventType.RESUME_PENDING,
+            1,
+            "live",
+        )
+    )
+    candidates = [
+        _Candidate(1, (b"shared-key",), (b"shared",)),
+        _Candidate(2, (b"unowned-key",), (b"unowned",)),
+    ]
+
+    plan = controller.plan_evictions(candidates, num_at_risk_blocks=1)
+
+    assert [target.block_id for target in plan] == [2]
+
+
+def test_lifecycle_state_changes_content_addressed_eviction_plan() -> None:
+    controller = AgentKVController()
+    controller.register_request(make_metadata(1, "resume"), "request-resume")
+    controller.register_request(make_metadata(1, "expired"), "request-expired")
+    controller.finish_request("request-resume", [b"resume-hash"])
+    controller.finish_request("request-expired", [b"expired-hash"])
+    controller.apply_event(
+        AgentKVEvent(
+            event_id="resume",
+            event_sequence=1,
+            event_type=AgentKVEventType.RESUME_PENDING,
+            emitted_at_ms=1_000,
+            namespace="tenant-a",
+            session_id="resume",
+            generation=1,
+        )
+    )
+    controller.apply_event(
+        AgentKVEvent(
+            event_id="expire",
+            event_sequence=1,
+            event_type=AgentKVEventType.GENERATION_EXPIRED,
+            emitted_at_ms=1_000,
+            namespace="tenant-a",
+            session_id="expired",
+            generation=1,
+        )
+    )
+    candidates = [
+        _Candidate(1, (b"resume-key",), (b"resume-hash",)),
+        _Candidate(2, (b"expired-key",), (b"expired-hash",)),
+    ]
+
+    plan = controller.plan_evictions(candidates, num_at_risk_blocks=1)
+
+    assert [target.block_id for target in plan] == [2]
+    assert plan[0].eviction_class == AgentKVEvictionClass.EVICT_FIRST

@@ -392,6 +392,27 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    def insert_before(
+        self,
+        reference: KVCacheBlock,
+        blocks: list[KVCacheBlock],
+    ) -> None:
+        """Insert detached blocks immediately before a queued reference."""
+        if not blocks:
+            return
+        previous = reference.prev_free_block
+        if previous is None:
+            raise RuntimeError("reference block is not in the free list")
+
+        for block in blocks:
+            assert block.prev_free_block is None and block.next_free_block is None
+            previous.next_free_block = block
+            block.prev_free_block = previous
+            previous = block
+        previous.next_free_block = reference
+        reference.prev_free_block = previous
+        self.num_free_blocks += len(blocks)
+
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
 

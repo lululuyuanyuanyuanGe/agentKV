@@ -1,15 +1,15 @@
 # AgentKV lifecycle protocol
 
 AgentKV is an experimental, application-aware lifecycle signal for the vLLM
-prefix cache. Version 1 records upstream intent and cache content identities but
-does not change cache placement or eviction behavior.
+prefix cache. Version 1 records upstream intent and cache content identities and
+uses them to refine eviction order when an allocation would overwrite idle
+cached blocks.
 
 The protocol separates business facts from resource decisions:
 
 - The upstream agent runtime reports stable identity and lifecycle events.
 - vLLM observes cache hashes, allocation pressure, capacity, and transfers.
-- A future policy layer will combine both sources to choose retention,
-  offload, eviction, or prefetch actions.
+- The policy layer combines both sources to refine immediate eviction choices.
 
 Upstream clients must never send prompt text, model output, tool arguments,
 tool results, physical cache block identifiers, or cache hashes through this
@@ -121,9 +121,27 @@ within `(namespace, session_id, branch_id)`. It is independent for each branch.
 An older generation's delayed `SUSPEND` event cannot change a newer active
 generation. `SESSION_TERMINATED` is session-scoped and terminates every branch.
 
+## Eviction behavior
+
+AgentKV only evaluates blocks that are already free and therefore eligible for
+native prefix-cache eviction. It never removes or reorders a block referenced by
+a running request. The policy is invoked only when the current allocation would
+overwrite cached blocks.
+
+The default retention order is `RESUME_PENDING`, `ACTIVE`, `SUSPENDED`, native
+unowned cache, then `EXPIRED` or `TERMINATED`. Higher priority, an active
+`retain_for_ms` window, and a nearer expected resume refine ties. A block shared
+by several generations uses its most protective live owner. Blocks with equal
+AgentKV policy scores retain native LRU order.
+
+Plans use content hashes for ownership and validate the complete cache key set
+before changing the free queue. A stale plan is ignored if its physical block
+identifier has been reused or its cache aliases have changed.
+
 ## Current limitations
 
-- Version 1 is metadata-only and does not retain, offload, evict, or prefetch.
+- Version 1 only refines idle GPU cache eviction order. It does not offload or
+  prefetch cache data, reserve fixed capacity, or guarantee retention.
 - Lifecycle endpoints are development endpoints and require an authenticated,
   trusted gateway before production use.
 - Data-parallel deployments do not yet provide session-affine request routing.

@@ -278,6 +278,10 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        self.kv_cache_manager.block_pool.set_free_cached_block_eviction_planner(
+            self.agent_kv_controller.plan_evictions,
+            self.agent_kv_controller.has_cache_owners,
+        )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:

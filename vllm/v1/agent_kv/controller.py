@@ -1,13 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Scheduler-side lifecycle state tracking for AgentKV."""
+"""Scheduler-side lifecycle state and cache ownership tracking for AgentKV."""
+
+from __future__ import annotations
 
 import time
 from collections import OrderedDict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Protocol
 
+from vllm.v1.agent_kv.ownership import (
+    AgentKVGenerationKey,
+    AgentKVOwnershipIndex,
+)
+from vllm.v1.agent_kv.policy import (
+    AgentKVCacheBlockCandidate,
+    AgentKVEvictionTarget,
+    AgentKVPolicyOwner,
+    plan_agent_kv_evictions,
+)
 from vllm.v1.agent_kv.protocol import (
     AGENT_KV_PROTOCOL_VERSION,
     AgentKVEvent,
@@ -28,7 +41,7 @@ class _GenerationRecord:
     state: AgentKVLifecycleState = AgentKVLifecycleState.ACTIVE
     active_request_ids: set[str] = field(default_factory=set)
     finished_request_count: int = 0
-    block_hashes: tuple[bytes, ...] = ()
+    block_hashes: set[bytes] = field(default_factory=set)
     latest_hints: AgentKVEventHints | None = None
     last_event_type: AgentKVEventType | None = None
     last_event_emitted_at_ms: int | None = None
@@ -54,13 +67,20 @@ class _SessionRecord:
     last_updated_ms: int = 0
 
 
+class AgentKVBlockCandidate(Protocol):
+    """Content-only block snapshot accepted from the allocator."""
+
+    block_id: int
+    cache_keys: tuple[bytes, ...]
+    content_hashes: tuple[bytes, ...]
+
+
 class AgentKVController:
-    """Tracks upstream lifecycle facts without changing cache policy.
+    """Tracks upstream facts and plans content-addressed cache ordering.
 
     The controller deliberately stores content hashes instead of physical block
     identifiers. Block identifiers are allocator-owned and may be reused after
-    a request finishes. Cache actions will be added behind this boundary in a
-    later phase.
+    a request finishes.
     """
 
     def __init__(self, max_sessions: int = _DEFAULT_MAX_SESSIONS) -> None:
@@ -69,6 +89,7 @@ class AgentKVController:
         self.max_sessions = max_sessions
         self._sessions: OrderedDict[tuple[str, str], _SessionRecord] = OrderedDict()
         self._request_index: dict[str, tuple[tuple[str, str], str, int]] = {}
+        self._ownership = AgentKVOwnershipIndex()
 
     @staticmethod
     def _now_ms() -> int:
@@ -83,6 +104,7 @@ class AgentKVController:
             while len(self._sessions) >= self.max_sessions:
                 evicted_key, _ = self._sessions.popitem(last=False)
                 self._remove_request_index_for_session(evicted_key)
+                self._ownership.remove_session(*evicted_key)
             session = _SessionRecord()
             self._sessions[key] = session
         else:
@@ -113,13 +135,25 @@ class AgentKVController:
             branch.generations.move_to_end(generation)
         return branch, record
 
-    @staticmethod
-    def _prune_generations(branch: _BranchRecord) -> None:
+    def _prune_branch_generations(
+        self,
+        session_key: tuple[str, str],
+        branch_id: str,
+        branch: _BranchRecord,
+    ) -> None:
         while len(branch.generations) > _MAX_GENERATIONS_PER_BRANCH:
             generation, record = next(iter(branch.generations.items()))
             if record.active_request_ids:
                 break
             del branch.generations[generation]
+            self._ownership.remove_owner(
+                AgentKVGenerationKey(
+                    namespace=session_key[0],
+                    session_id=session_key[1],
+                    branch_id=branch_id,
+                    generation=generation,
+                )
+            )
 
     @staticmethod
     def _remember_event(session: _SessionRecord, event_id: str) -> None:
@@ -142,7 +176,9 @@ class AgentKVController:
         now_ms = self._now_ms()
         generation.active_request_ids.add(request_id)
         generation.last_updated_ms = now_ms
-        if not session.terminated and metadata.generation >= branch.current_generation:
+        if session.terminated:
+            generation.state = AgentKVLifecycleState.TERMINATED
+        elif metadata.generation >= branch.current_generation:
             branch.current_generation = metadata.generation
             generation.state = AgentKVLifecycleState.ACTIVE
         session.last_updated_ms = now_ms
@@ -151,7 +187,7 @@ class AgentKVController:
             metadata.branch_id,
             metadata.generation,
         )
-        self._prune_generations(branch)
+        self._prune_branch_generations(key, metadata.branch_id, branch)
 
     def finish_request(self, request_id: str, block_hashes: Iterable[bytes]) -> None:
         """Persist the content identity before scheduler request state is freed."""
@@ -170,18 +206,26 @@ class AgentKVController:
             return
         generation.active_request_ids.discard(request_id)
         generation.finished_request_count += 1
-        hashes = tuple(bytes(block_hash) for block_hash in block_hashes)
-        if len(hashes) >= len(generation.block_hashes):
-            generation.block_hashes = hashes
+        hashes = {bytes(block_hash) for block_hash in block_hashes}
+        generation.block_hashes.update(hashes)
+        self._ownership.add(
+            AgentKVGenerationKey(
+                namespace=key[0],
+                session_id=key[1],
+                branch_id=branch_id,
+                generation=generation_id,
+            ),
+            hashes,
+        )
         now_ms = self._now_ms()
         generation.last_updated_ms = now_ms
         session.last_updated_ms = now_ms
         self._sessions.move_to_end(key)
-        self._prune_generations(branch)
+        self._prune_branch_generations(key, branch_id, branch)
 
     def apply_event(self, event: AgentKVEvent) -> dict[str, object]:
         """Apply one idempotent, ordered lifecycle event."""
-        _, session = self._get_or_create_session(event.namespace, event.session_id)
+        key, session = self._get_or_create_session(event.namespace, event.session_id)
 
         if event.event_id in session.seen_event_ids:
             return self._result(AgentKVEventStatus.DUPLICATE, session, event)
@@ -213,11 +257,11 @@ class AgentKVController:
             generation.last_updated_ms = session.last_updated_ms
             if event.generation > branch.current_generation:
                 branch.current_generation = event.generation
-            self._prune_generations(branch)
+            self._prune_branch_generations(key, event.branch_id, branch)
             return self._result(AgentKVEventStatus.ACCEPTED, session, event)
 
         if event.generation < branch.current_generation:
-            self._prune_generations(branch)
+            self._prune_branch_generations(key, event.branch_id, branch)
             return self._result(AgentKVEventStatus.STALE_GENERATION, session, event)
 
         if event.generation > branch.current_generation:
@@ -230,8 +274,77 @@ class AgentKVController:
             else AgentKVLifecycleState.RESUME_PENDING
         )
         generation.last_updated_ms = session.last_updated_ms
-        self._prune_generations(branch)
+        self._prune_branch_generations(key, event.branch_id, branch)
         return self._result(AgentKVEventStatus.ACCEPTED, session, event)
+
+    def has_cache_owners(self) -> bool:
+        """Return whether policy evaluation could affect cache ordering."""
+        return bool(self._ownership)
+
+    def get_block_owners(self, block_hash: bytes) -> frozenset[AgentKVGenerationKey]:
+        """Return generation identities associated with a content hash."""
+        return self._ownership.get_owners(block_hash)
+
+    def plan_evictions(
+        self,
+        candidates: Sequence[AgentKVBlockCandidate],
+        num_at_risk_blocks: int,
+    ) -> tuple[AgentKVEvictionTarget, ...]:
+        """Attach current lifecycle facts and invoke the pure policy."""
+        now_ms = self._now_ms()
+        policy_candidates: list[AgentKVCacheBlockCandidate] = []
+        for candidate in candidates:
+            cache_keys = tuple(candidate.cache_keys)
+            content_hashes = tuple(candidate.content_hashes)
+            owner_keys: set[AgentKVGenerationKey] = set()
+            for content_hash in content_hashes:
+                owner_keys.update(self._ownership.get_owners(content_hash))
+            owners = tuple(
+                owner
+                for owner_key in owner_keys
+                if (owner := self._get_policy_owner(owner_key)) is not None
+            )
+            policy_candidates.append(
+                AgentKVCacheBlockCandidate(
+                    block_id=candidate.block_id,
+                    cache_keys=cache_keys,
+                    content_hashes=content_hashes,
+                    owners=owners,
+                )
+            )
+        return plan_agent_kv_evictions(
+            policy_candidates,
+            num_at_risk_blocks,
+            now_ms,
+        )
+
+    def _get_policy_owner(self, key: AgentKVGenerationKey) -> AgentKVPolicyOwner | None:
+        session = self._sessions.get((key.namespace, key.session_id))
+        branch = session.branches.get(key.branch_id) if session is not None else None
+        generation = (
+            branch.generations.get(key.generation) if branch is not None else None
+        )
+        if generation is None:
+            return None
+        hints = generation.latest_hints
+        retain_until_ms = (
+            generation.last_updated_ms + hints.retain_for_ms
+            if hints is not None and hints.retain_for_ms is not None
+            else None
+        )
+        resume_due_at_ms = (
+            generation.last_updated_ms + hints.expected_resume_in_ms
+            if hints is not None and hints.expected_resume_in_ms is not None
+            else None
+        )
+        return AgentKVPolicyOwner(
+            key=key,
+            state=generation.state,
+            priority=hints.priority if hints and hints.priority is not None else 0,
+            retain_until_ms=retain_until_ms,
+            resume_due_at_ms=resume_due_at_ms,
+            last_updated_ms=generation.last_updated_ms,
+        )
 
     @staticmethod
     def _record_event_details(
