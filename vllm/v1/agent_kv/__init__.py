@@ -3,6 +3,14 @@
 
 """Application-aware KV cache lifecycle tracking."""
 
+from vllm.v1.agent_kv.action import (
+    AgentKVActionPlan,
+    AgentKVCacheAction,
+    AgentKVCacheActionType,
+    AgentKVPressure,
+    AgentKVPressureLevel,
+    plan_agent_kv_cache_actions,
+)
 from vllm.v1.agent_kv.controller import AgentKVController
 from vllm.v1.agent_kv.ownership import AgentKVGenerationKey
 from vllm.v1.agent_kv.policy import (
@@ -25,6 +33,9 @@ from vllm.v1.agent_kv.protocol import (
 
 __all__ = [
     "AGENT_KV_PROTOCOL_VERSION",
+    "AgentKVActionPlan",
+    "AgentKVCacheAction",
+    "AgentKVCacheActionType",
     "AgentKVController",
     "AgentKVCacheBlockCandidate",
     "AgentKVEvictionClass",
@@ -37,6 +48,9 @@ __all__ = [
     "AgentKVLifecycleState",
     "AgentKVRequestMetadata",
     "AgentKVPolicyOwner",
+    "AgentKVPressure",
+    "AgentKVPressureLevel",
+    "plan_agent_kv_cache_actions",
     "plan_agent_kv_evictions",
     "parse_agent_kv_request_metadata",
 ]

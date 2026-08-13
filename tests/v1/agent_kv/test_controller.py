@@ -3,6 +3,11 @@
 
 from dataclasses import dataclass
 
+from vllm.v1.agent_kv.action import (
+    AgentKVCacheActionType,
+    AgentKVPressure,
+    AgentKVPressureLevel,
+)
 from vllm.v1.agent_kv.controller import AgentKVController
 from vllm.v1.agent_kv.policy import AgentKVEvictionClass
 from vllm.v1.agent_kv.protocol import (
@@ -269,3 +274,44 @@ def test_lifecycle_state_changes_content_addressed_eviction_plan() -> None:
 
     assert [target.block_id for target in plan] == [2]
     assert plan[0].eviction_class == AgentKVEvictionClass.EVICT_FIRST
+
+
+def test_async_offload_action_is_invalidated_by_resume() -> None:
+    controller = AgentKVController()
+    controller.register_request(make_metadata(1), "request-1")
+    controller.finish_request("request-1", [b"suspended-hash"])
+    controller.apply_event(make_event("suspend", 1, AgentKVEventType.SUSPEND, 1))
+    pressure = AgentKVPressure(
+        level=AgentKVPressureLevel.SOFT,
+        target_blocks=1,
+        available_offload_blocks=1,
+    )
+    candidate = _Candidate(1, (b"cache-key",), (b"suspended-hash",))
+
+    action = controller.plan_cache_actions([candidate], pressure).actions[0]
+
+    assert action.action == AgentKVCacheActionType.OFFLOAD
+    assert controller.validate_cache_action(action)
+
+    controller.apply_event(make_event("resume", 2, AgentKVEventType.RESUME_PENDING, 1))
+
+    assert not controller.validate_cache_action(action)
+
+
+def test_native_store_action_is_invalidated_when_block_gains_an_owner() -> None:
+    controller = AgentKVController()
+    pressure = AgentKVPressure(
+        level=AgentKVPressureLevel.SOFT,
+        target_blocks=1,
+        available_offload_blocks=1,
+    )
+    candidate = _Candidate(1, (b"cache-key",), (b"shared-hash",))
+    action = controller.plan_cache_actions([candidate], pressure).actions[0]
+
+    assert action.action == AgentKVCacheActionType.DEFAULT
+    assert controller.validate_cache_action(action)
+
+    controller.register_request(make_metadata(1), "new-owner")
+    controller.finish_request("new-owner", [b"shared-hash"])
+
+    assert not controller.validate_cache_action(action)

@@ -9,8 +9,16 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
 
+from vllm.v1.agent_kv.action import (
+    AgentKVActionPlan,
+    AgentKVCacheAction,
+    AgentKVCacheActionType,
+    AgentKVCacheSnapshot,
+    AgentKVPressure,
+    AgentKVPressureLevel,
+    plan_agent_kv_cache_actions,
+)
 from vllm.v1.agent_kv.ownership import (
     AgentKVGenerationKey,
     AgentKVOwnershipIndex,
@@ -67,12 +75,19 @@ class _SessionRecord:
     last_updated_ms: int = 0
 
 
-class AgentKVBlockCandidate(Protocol):
-    """Content-only block snapshot accepted from the allocator."""
-
+@dataclass(frozen=True, slots=True)
+class _ActionSnapshot:
     block_id: int
     cache_keys: tuple[bytes, ...]
     content_hashes: tuple[bytes, ...]
+
+    @classmethod
+    def from_action(cls, action: AgentKVCacheAction) -> _ActionSnapshot:
+        return cls(
+            block_id=action.block_id,
+            cache_keys=action.expected_cache_keys,
+            content_hashes=action.content_hashes,
+        )
 
 
 class AgentKVController:
@@ -90,10 +105,14 @@ class AgentKVController:
         self._sessions: OrderedDict[tuple[str, str], _SessionRecord] = OrderedDict()
         self._request_index: dict[str, tuple[tuple[str, str], str, int]] = {}
         self._ownership = AgentKVOwnershipIndex()
+        self._policy_revision = 0
 
     @staticmethod
     def _now_ms() -> int:
         return time.time_ns() // 1_000_000
+
+    def _bump_policy_revision(self) -> None:
+        self._policy_revision += 1
 
     def _get_or_create_session(
         self, namespace: str, session_id: str
@@ -188,6 +207,7 @@ class AgentKVController:
             metadata.generation,
         )
         self._prune_branch_generations(key, metadata.branch_id, branch)
+        self._bump_policy_revision()
 
     def finish_request(self, request_id: str, block_hashes: Iterable[bytes]) -> None:
         """Persist the content identity before scheduler request state is freed."""
@@ -222,6 +242,7 @@ class AgentKVController:
         session.last_updated_ms = now_ms
         self._sessions.move_to_end(key)
         self._prune_branch_generations(key, branch_id, branch)
+        self._bump_policy_revision()
 
     def apply_event(self, event: AgentKVEvent) -> dict[str, object]:
         """Apply one idempotent, ordered lifecycle event."""
@@ -245,6 +266,7 @@ class AgentKVController:
             for branch in session.branches.values():
                 for generation in branch.generations.values():
                     generation.state = AgentKVLifecycleState.TERMINATED
+            self._bump_policy_revision()
             return self._result(AgentKVEventStatus.ACCEPTED, session, event)
 
         branch, generation = self._get_or_create_generation(
@@ -258,6 +280,7 @@ class AgentKVController:
             if event.generation > branch.current_generation:
                 branch.current_generation = event.generation
             self._prune_branch_generations(key, event.branch_id, branch)
+            self._bump_policy_revision()
             return self._result(AgentKVEventStatus.ACCEPTED, session, event)
 
         if event.generation < branch.current_generation:
@@ -275,6 +298,7 @@ class AgentKVController:
         )
         generation.last_updated_ms = session.last_updated_ms
         self._prune_branch_generations(key, event.branch_id, branch)
+        self._bump_policy_revision()
         return self._result(AgentKVEventStatus.ACCEPTED, session, event)
 
     def has_cache_owners(self) -> bool:
@@ -287,11 +311,57 @@ class AgentKVController:
 
     def plan_evictions(
         self,
-        candidates: Sequence[AgentKVBlockCandidate],
+        candidates: Sequence[AgentKVCacheSnapshot],
         num_at_risk_blocks: int,
     ) -> tuple[AgentKVEvictionTarget, ...]:
         """Attach current lifecycle facts and invoke the pure policy."""
         now_ms = self._now_ms()
+        policy_candidates = self._build_policy_candidates(candidates)
+        return plan_agent_kv_evictions(
+            policy_candidates,
+            num_at_risk_blocks,
+            now_ms,
+        )
+
+    def plan_cache_actions(
+        self,
+        candidates: Sequence[AgentKVCacheSnapshot],
+        pressure: AgentKVPressure,
+    ) -> AgentKVActionPlan:
+        """Plan lower-tier actions from a consistent lifecycle revision."""
+        return plan_agent_kv_cache_actions(
+            self._build_policy_candidates(candidates),
+            pressure,
+            self._now_ms(),
+            self._policy_revision,
+        )
+
+    def validate_cache_action(self, action: AgentKVCacheAction) -> bool:
+        """Revalidate an asynchronous store before publishing its result."""
+        if action.action not in (
+            AgentKVCacheActionType.DEFAULT,
+            AgentKVCacheActionType.OFFLOAD,
+        ):
+            return False
+        pressure = AgentKVPressure(
+            level=AgentKVPressureLevel.SOFT,
+            target_blocks=1,
+            available_offload_blocks=1,
+        )
+        current = self.plan_cache_actions(
+            [_ActionSnapshot.from_action(action)], pressure
+        ).actions[0]
+        return (
+            current.action == action.action
+            and current.owner_keys == action.owner_keys
+            and current.expected_cache_keys == action.expected_cache_keys
+            and current.content_hashes == action.content_hashes
+        )
+
+    def _build_policy_candidates(
+        self,
+        candidates: Sequence[AgentKVCacheSnapshot],
+    ) -> list[AgentKVCacheBlockCandidate]:
         policy_candidates: list[AgentKVCacheBlockCandidate] = []
         for candidate in candidates:
             cache_keys = tuple(candidate.cache_keys)
@@ -301,7 +371,15 @@ class AgentKVController:
                 owner_keys.update(self._ownership.get_owners(content_hash))
             owners = tuple(
                 owner
-                for owner_key in owner_keys
+                for owner_key in sorted(
+                    owner_keys,
+                    key=lambda key: (
+                        key.namespace,
+                        key.session_id,
+                        key.branch_id,
+                        key.generation,
+                    ),
+                )
                 if (owner := self._get_policy_owner(owner_key)) is not None
             )
             policy_candidates.append(
@@ -312,11 +390,7 @@ class AgentKVController:
                     owners=owners,
                 )
             )
-        return plan_agent_kv_evictions(
-            policy_candidates,
-            num_at_risk_blocks,
-            now_ms,
-        )
+        return policy_candidates
 
     def _get_policy_owner(self, key: AgentKVGenerationKey) -> AgentKVPolicyOwner | None:
         session = self._sessions.get((key.namespace, key.session_id))

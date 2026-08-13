@@ -30,6 +30,11 @@ from vllm.v1.simple_kv_offload.worker import (
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
+    from vllm.v1.agent_kv.action import (
+        AgentKVActionPlanner,
+        AgentKVActionPolicyEnabled,
+        AgentKVActionValidator,
+    )
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -231,6 +236,17 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         if self.scheduler_manager is not None:
             self.scheduler_manager.bind_gpu_block_pool(gpu_block_pool)
+
+    def bind_agent_kv_action_policy(
+        self,
+        planner: "AgentKVActionPlanner",
+        validator: "AgentKVActionValidator",
+        enabled: "AgentKVActionPolicyEnabled",
+    ) -> None:
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.bind_agent_kv_action_policy(
+                planner, validator, enabled
+            )
 
     def get_num_new_matched_tokens(
         self,

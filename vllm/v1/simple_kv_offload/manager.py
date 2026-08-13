@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -12,7 +13,16 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.agent_kv.action import (
+    AgentKVActionPlanner,
+    AgentKVActionPolicyEnabled,
+    AgentKVActionValidator,
+    AgentKVCacheAction,
+    AgentKVCacheActionType,
+    AgentKVPressure,
+    AgentKVPressureLevel,
+)
+from vllm.v1.core.block_pool import BlockPool, FreeCachedBlockSnapshot
 from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -42,6 +52,7 @@ logger = init_logger(__name__)
 class TransferMeta:
     gpu_block_ids: list[int]
     cpu_block_ids: list[int]
+    agent_kv_actions: tuple[AgentKVCacheAction | None, ...] = ()
 
 
 @dataclass
@@ -141,6 +152,12 @@ class SimpleCPUOffloadScheduler:
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
+        self._agent_kv_action_planner: AgentKVActionPlanner | None = None
+        self._agent_kv_action_validator: AgentKVActionValidator | None = None
+        self._agent_kv_action_policy_enabled: AgentKVActionPolicyEnabled | None = None
+        self._agent_kv_policy_revision: int | None = None
+        self._agent_kv_reconsider_at_ms: int | None = None
+        self._prepared_agent_kv_actions: dict[int, AgentKVCacheAction] = {}
 
         # Load metadata
         self._reqs_to_load: dict[str, LoadRequestState] = {}
@@ -245,6 +262,17 @@ class SimpleCPUOffloadScheduler:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+
+    def bind_agent_kv_action_policy(
+        self,
+        planner: AgentKVActionPlanner,
+        validator: AgentKVActionValidator,
+        enabled: AgentKVActionPolicyEnabled,
+    ) -> None:
+        """Bind AgentKV tier actions used only by lazy offload mode."""
+        self._agent_kv_action_planner = planner
+        self._agent_kv_action_validator = validator
+        self._agent_kv_action_policy_enabled = enabled
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -415,12 +443,18 @@ class SimpleCPUOffloadScheduler:
     ) -> SimpleCPUOffloadMetadata:
         # --- Stores ---
         store_event = -1
+        self._prepared_agent_kv_actions.clear()
         store_gpu, store_cpu, store_req_ids = self.prepare_store_specs(scheduler_output)
         if store_gpu:
             store_event = self._store_event_counter
             self._store_event_counter += 1
+            actions = tuple(
+                self._prepared_agent_kv_actions.get(block_id) for block_id in store_gpu
+            )
             self._store_event_to_blocks[store_event] = TransferMeta(
-                store_gpu, store_cpu
+                store_gpu,
+                store_cpu,
+                actions if any(action is not None for action in actions) else (),
             )
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
@@ -493,6 +527,140 @@ class SimpleCPUOffloadScheduler:
         if self._cursor is not None and self._cursor.ref_cnt > 0:
             self._cursor = None
 
+        planner = self._agent_kv_action_planner
+        enabled = self._agent_kv_action_policy_enabled
+        if planner is None or enabled is None:
+            return self._prepare_native_lazy_store_specs(
+                gpu_pool,
+                num_cpu_free,
+            )
+        try:
+            policy_enabled = enabled()
+        except Exception:
+            logger.exception(
+                "AgentKV action policy check failed; using native lazy store"
+            )
+            policy_enabled = False
+        if not policy_enabled:
+            return self._prepare_native_lazy_store_specs(
+                gpu_pool,
+                num_cpu_free,
+            )
+
+        pressure = AgentKVPressure(
+            level=AgentKVPressureLevel.SOFT,
+            target_blocks=self._target_free,
+            available_offload_blocks=num_cpu_free,
+        )
+        try:
+            probe = planner((), pressure)
+        except Exception:
+            logger.exception("AgentKV action planner failed; using native lazy store")
+            return self._prepare_native_lazy_store_specs(
+                gpu_pool,
+                num_cpu_free,
+            )
+
+        now_ms = time.time_ns() // 1_000_000
+        policy_changed = probe.policy_revision != self._agent_kv_policy_revision
+        reconsider_due = (
+            self._agent_kv_reconsider_at_ms is not None
+            and now_ms >= self._agent_kv_reconsider_at_ms
+        )
+        if policy_changed or reconsider_due:
+            self._cursor = None
+            self._agent_kv_policy_revision = probe.policy_revision
+            self._agent_kv_reconsider_at_ms = None
+
+        if num_cpu_free <= 0:
+            return [], [], []
+
+        nodes = []
+        snapshots = []
+        for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
+            if covered >= self._target_free:
+                break
+            nodes.append(node)
+            bhash = node.block_hash
+            if (
+                bhash is None
+                or node.is_null
+                or cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is not None
+            ):
+                continue
+            snapshot = gpu_pool.get_free_cached_block_snapshot(node.block_id)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+
+        try:
+            plan = planner(snapshots, pressure)
+            if plan.policy_revision != probe.policy_revision:
+                raise RuntimeError("AgentKV policy changed while planning actions")
+            actions_by_block_id = self._validate_agent_kv_action_plan(
+                plan.actions,
+                snapshots,
+            )
+        except Exception:
+            logger.exception("AgentKV action planner failed; using native lazy store")
+            return self._prepare_native_lazy_store_specs(
+                gpu_pool,
+                num_cpu_free,
+            )
+
+        if plan.reconsider_at_ms is not None:
+            self._agent_kv_reconsider_at_ms = (
+                plan.reconsider_at_ms
+                if self._agent_kv_reconsider_at_ms is None
+                else min(
+                    self._agent_kv_reconsider_at_ms,
+                    plan.reconsider_at_ms,
+                )
+            )
+
+        gpu_ids: list[int] = []
+        block_hashes: list[bytes] = []
+        last_visited = self._cursor
+        for node in nodes:
+            if len(gpu_ids) >= num_cpu_free:
+                break
+            last_visited = node
+            action = actions_by_block_id.get(node.block_id)
+            if action is None:
+                continue
+            if action.action in (
+                AgentKVCacheActionType.KEEP,
+                AgentKVCacheActionType.DROP,
+            ):
+                continue
+            snapshot = gpu_pool.get_free_cached_block_snapshot(node.block_id)
+            if (
+                snapshot is None
+                or snapshot.cache_keys != action.expected_cache_keys
+                or snapshot.content_hashes != action.content_hashes
+            ):
+                continue
+            bhash = node.block_hash
+            if (
+                bhash is None
+                or cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is not None
+            ):
+                continue
+            gpu_ids.append(node.block_id)
+            block_hashes.append(bhash)
+            self._prepared_agent_kv_actions[node.block_id] = action
+
+        self._cursor = last_visited
+        return self._allocate_lazy_store_blocks(gpu_pool, gpu_ids, block_hashes)
+
+    def _prepare_native_lazy_store_specs(
+        self,
+        gpu_pool: BlockPool,
+        num_cpu_free: int,
+    ) -> tuple[list[int], list[int], list[str]]:
+        """Preserve the native lazy scanner when AgentKV is inactive."""
+        free_queue = gpu_pool.free_block_queue
+        cpu_pool = self.cpu_block_pool
+
         gpu_ids: list[int] = []
         block_hashes: list[bytes] = []
         last_visited = self._cursor
@@ -514,6 +682,17 @@ class SimpleCPUOffloadScheduler:
 
         self._cursor = last_visited
 
+        return self._allocate_lazy_store_blocks(gpu_pool, gpu_ids, block_hashes)
+
+    def _allocate_lazy_store_blocks(
+        self,
+        gpu_pool: BlockPool,
+        gpu_ids: list[int],
+        block_hashes: list[bytes],
+    ) -> tuple[list[int], list[int], list[str]]:
+        """Allocate destination blocks and pin source blocks for one store."""
+        cpu_pool = self.cpu_block_pool
+
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
             cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
@@ -526,6 +705,31 @@ class SimpleCPUOffloadScheduler:
             cpu_ids = []
 
         return gpu_ids, cpu_ids, []
+
+    @staticmethod
+    def _validate_agent_kv_action_plan(
+        actions: tuple[AgentKVCacheAction, ...],
+        snapshots: list[FreeCachedBlockSnapshot],
+    ) -> dict[int, AgentKVCacheAction]:
+        """Require exactly one compare-and-validate action per snapshot."""
+        if len(actions) != len(snapshots):
+            raise ValueError("AgentKV action count does not match candidate count")
+        snapshots_by_block_id = {snapshot.block_id: snapshot for snapshot in snapshots}
+        if len(snapshots_by_block_id) != len(snapshots):
+            raise ValueError("AgentKV candidates contain duplicate block ids")
+
+        actions_by_block_id: dict[int, AgentKVCacheAction] = {}
+        for action in actions:
+            snapshot = snapshots_by_block_id.get(action.block_id)
+            if (
+                snapshot is None
+                or action.block_id in actions_by_block_id
+                or action.expected_cache_keys != snapshot.cache_keys
+                or action.content_hashes != snapshot.content_hashes
+            ):
+                raise ValueError("AgentKV action does not match its cache snapshot")
+            actions_by_block_id[action.block_id] = action
+        return actions_by_block_id
 
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -708,11 +912,18 @@ class SimpleCPUOffloadScheduler:
         if not self._lazy_mode:
             self._in_flight_store_gpu_blocks.difference_update(transfer.gpu_block_ids)
 
-        self._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
+        accepted, rejected = self._partition_agent_kv_store_completion(transfer)
+        if accepted.gpu_block_ids:
+            self._process_store_completion(
+                accepted.gpu_block_ids,
+                accepted.cpu_block_ids,
+            )
+        if rejected.gpu_block_ids:
+            self._release_transfer_refs(rejected)
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
             event_idx,
-            len(transfer.cpu_block_ids),
+            len(accepted.cpu_block_ids),
         )
 
         # Eager only: update per-req state
@@ -724,6 +935,48 @@ class SimpleCPUOffloadScheduler:
                 state.store_events.discard(event_idx)
                 if state.finished and not state.store_events:
                     self._cleanup_store_request(req_id)
+
+    def _partition_agent_kv_store_completion(
+        self,
+        transfer: TransferMeta,
+    ) -> tuple[TransferMeta, TransferMeta]:
+        """Discard offloads invalidated by a later lifecycle transition."""
+        actions = transfer.agent_kv_actions
+        if not actions:
+            return transfer, TransferMeta([], [])
+        if len(actions) != len(transfer.gpu_block_ids):
+            logger.error("Invalid AgentKV store metadata; discarding store event")
+            return TransferMeta([], []), transfer
+
+        accepted_gpu: list[int] = []
+        accepted_cpu: list[int] = []
+        rejected_gpu: list[int] = []
+        rejected_cpu: list[int] = []
+        validator = self._agent_kv_action_validator
+        for gpu_block_id, cpu_block_id, action in zip(
+            transfer.gpu_block_ids,
+            transfer.cpu_block_ids,
+            actions,
+        ):
+            valid = action is None
+            if action is not None and validator is not None:
+                try:
+                    valid = validator(action)
+                except Exception:
+                    logger.exception(
+                        "AgentKV action validation failed; discarding offload"
+                    )
+            if valid:
+                accepted_gpu.append(gpu_block_id)
+                accepted_cpu.append(cpu_block_id)
+            else:
+                rejected_gpu.append(gpu_block_id)
+                rejected_cpu.append(cpu_block_id)
+
+        return (
+            TransferMeta(accepted_gpu, accepted_cpu),
+            TransferMeta(rejected_gpu, rejected_cpu),
+        )
 
     def _process_store_completion(
         self, gpu_block_ids: list[int], cpu_block_ids: list[int]

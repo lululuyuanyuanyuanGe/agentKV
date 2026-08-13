@@ -2,8 +2,9 @@
 
 AgentKV is an experimental, application-aware lifecycle signal for the vLLM
 prefix cache. Version 1 records upstream intent and cache content identities and
-uses them to refine eviction order when an allocation would overwrite idle
-cached blocks.
+uses them to refine eviction order and, when lazy native offload is configured,
+to choose whether an idle block should stay local, be copied to a lower tier,
+or be dropped without creating another copy.
 
 The protocol separates business facts from resource decisions:
 
@@ -124,24 +125,68 @@ generation. `SESSION_TERMINATED` is session-scoped and terminates every branch.
 ## Eviction behavior
 
 AgentKV only evaluates blocks that are already free and therefore eligible for
-native prefix-cache eviction. It never removes or reorders a block referenced by
-a running request. The policy is invoked only when the current allocation would
-overwrite cached blocks.
+native prefix-cache eviction from graphics processing unit (GPU) memory. It
+never removes or reorders a block referenced by a running request. The policy is
+invoked only when the current allocation would overwrite cached blocks.
 
 The default retention order is `RESUME_PENDING`, `ACTIVE`, `SUSPENDED`, native
 unowned cache, then `EXPIRED` or `TERMINATED`. Higher priority, an active
 `retain_for_ms` window, and a nearer expected resume refine ties. A block shared
 by several generations uses its most protective live owner. Blocks with equal
-AgentKV policy scores retain native LRU order.
+AgentKV policy scores retain native least recently used (LRU) order.
 
 Plans use content hashes for ownership and validate the complete cache key set
 before changing the free queue. A stale plan is ignored if its physical block
 identifier has been reused or its cache aliases have changed.
 
+## Lazy tier actions
+
+When `SimpleCPUOffloadConnector` is configured with `lazy_offload=true`, its
+soft-pressure scan asks AgentKV for one action per eligible cached block:
+
+| Most protective owner state | Action | Effect |
+| --- | --- | --- |
+| `ACTIVE` or `RESUME_PENDING` | `KEEP` | Skip the lower-tier copy and leave eviction to the protected GPU ordering. |
+| `SUSPENDED` with an active `retain_for_ms` window | `KEEP` | Reconsider after the retain deadline. |
+| `SUSPENDED` | `OFFLOAD` | Copy to the configured central processing unit (CPU) or disk tier when capacity is available. |
+| All owners are `EXPIRED` or `TERMINATED` | `DROP` | Do not create a lower-tier copy; normal allocation performs physical eviction. |
+| No AgentKV owner | `DEFAULT` | Preserve the connector's native lazy-offload behavior. |
+
+Example connector configuration:
+
+```json
+{
+  "kv_connector": "SimpleCPUOffloadConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "cpu_bytes_to_use": 8589934592,
+    "lazy_offload": true
+  }
+}
+```
+
+Every action carries the complete cache-key snapshot, content hashes, owner
+generations, and controller policy revision. The connector compares the live
+cache snapshot before scheduling a copy. Because a store is asynchronous, it
+also asks the controller to validate `OFFLOAD` again before publishing the
+completed lower-tier entry. A resume, termination, owner-set change, block
+reuse, or alias change makes the stale result non-cacheable and only releases
+its transfer references.
+
+AgentKV state changes reset the lazy scan cursor so a previously skipped block
+can be reconsidered. Time-limited retention records the earliest deadline and
+does the same when that deadline expires. Capacity exhaustion is best effort:
+the scheduler never blocks inference waiting for lower-tier space.
+
 ## Current limitations
 
-- Version 1 only refines idle GPU cache eviction order. It does not offload or
-  prefetch cache data, reserve fixed capacity, or guarantee retention.
+- Tier actions currently integrate only with `SimpleCPUOffloadConnector` in
+  lazy mode. Eager offload and other connectors keep their native behavior.
+- Version 1 does not prefetch cache data, reserve fixed capacity, or guarantee
+  retention. `KEEP` is an ordering preference, and `DROP` does not proactively
+  remove a block.
+- Eviction within the lower tier still uses the connector's native policy;
+  AgentKV currently chooses admission to that tier, not its internal victims.
 - Lifecycle endpoints are development endpoints and require an authenticated,
   trusted gateway before production use.
 - Data-parallel deployments do not yet provide session-affine request routing.

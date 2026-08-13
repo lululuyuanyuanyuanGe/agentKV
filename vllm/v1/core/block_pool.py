@@ -764,19 +764,35 @@ class BlockPool:
         """Snapshot cached eviction candidates in their native order."""
         snapshots = []
         for block in self.free_block_queue.get_all_free_blocks():
-            cache_keys = self._get_block_cache_keys(block)
-            if not cache_keys:
-                continue
-            snapshots.append(
-                FreeCachedBlockSnapshot(
-                    block_id=block.block_id,
-                    cache_keys=cache_keys,
-                    content_hashes=tuple(
-                        sorted({bytes(get_block_hash(key)) for key in cache_keys})
-                    ),
-                )
-            )
+            if snapshot := self.get_free_cached_block_snapshot(block.block_id):
+                snapshots.append(snapshot)
         return tuple(snapshots)
+
+    def get_free_cached_block_snapshot(
+        self,
+        block_id: int,
+    ) -> FreeCachedBlockSnapshot | None:
+        """Snapshot one cached block only while it remains in the free queue."""
+        if not 0 <= block_id < len(self.blocks):
+            return None
+        block = self.blocks[block_id]
+        if (
+            block.ref_cnt != 0
+            or block.is_null
+            or block.prev_free_block is None
+            or block.next_free_block is None
+        ):
+            return None
+        cache_keys = self._get_block_cache_keys(block)
+        if not cache_keys:
+            return None
+        return FreeCachedBlockSnapshot(
+            block_id=block.block_id,
+            cache_keys=cache_keys,
+            content_hashes=tuple(
+                sorted({bytes(get_block_hash(key)) for key in cache_keys})
+            ),
+        )
 
     def prioritize_free_cached_blocks_for_eviction(
         self,

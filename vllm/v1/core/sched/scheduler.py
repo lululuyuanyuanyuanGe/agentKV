@@ -286,6 +286,11 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            self.connector.bind_agent_kv_action_policy(
+                self.agent_kv_controller.plan_cache_actions,
+                self.agent_kv_controller.validate_cache_action,
+                self.agent_kv_controller.has_cache_owners,
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
