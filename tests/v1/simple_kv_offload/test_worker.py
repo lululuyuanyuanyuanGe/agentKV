@@ -26,6 +26,7 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     build_params,
     pin_tensor,
 )
+from vllm.v1.simple_kv_offload.int8_backend import Int8DoubleBufferBackend
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
 
@@ -188,3 +189,56 @@ def test_build_params_src_access_order():
         gpu, cpu, stream, src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
     )
     assert ordered.attrs.srcAccessOrder == CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA only")
+def test_int8_backend_double_buffer_roundtrip_across_chunks() -> None:
+    """More than two chunks exercise slot reuse in both pipeline directions."""
+    torch.manual_seed(11)
+    cache = torch.randn((10, 513), dtype=torch.float16, device="cuda")
+    expected = cache[:5].clone()
+    low_priority, _ = torch.cuda.Stream.priority_range()
+    backend = Int8DoubleBufferBackend(buffer_blocks=2)
+    backend.init(
+        {"kv": cache},
+        num_cpu_blocks=10,
+        device=cache.device,
+        load_stream=torch.cuda.Stream(priority=low_priority),
+        store_stream=torch.cuda.Stream(priority=low_priority),
+    )
+
+    try:
+        store_events: list[tuple[int, torch.Event]] = []
+        backend.launch_copy(
+            list(range(5)),
+            list(range(5)),
+            is_store=True,
+            event_idx=0,
+            events_list=store_events,
+        )
+        deadline = time.time() + 10.0
+        while not store_events and time.time() < deadline:
+            time.sleep(0.0005)
+        assert store_events
+        store_events[0][1].synchronize()
+
+        cache[5:10].zero_()
+        load_events: list[tuple[int, torch.Event]] = []
+        backend.launch_copy(
+            list(range(5)),
+            list(range(5, 10)),
+            is_store=False,
+            event_idx=1,
+            events_list=load_events,
+        )
+        deadline = time.time() + 10.0
+        while not load_events and time.time() < deadline:
+            time.sleep(0.0005)
+        assert load_events
+        load_events[0][1].synchronize()
+    finally:
+        backend.shutdown()
+
+    torch.testing.assert_close(
+        cache[5:10].float(), expected.float(), rtol=0.02, atol=0.03
+    )

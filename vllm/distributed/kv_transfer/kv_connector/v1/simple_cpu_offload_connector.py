@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.manager import (
@@ -48,6 +49,7 @@ logger = init_logger(__name__)
 DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 
 VALID_KV_OFFLOAD_BACKENDS = ("cpu", "disk")
+VALID_KV_OFFLOAD_QUANTIZATIONS = ("none", "int8")
 # Keys that only apply to the disk backend, warned about under "cpu".
 _DISK_ONLY_KEYS = (
     "disk_path",
@@ -105,6 +107,25 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         disk_mode = kv_offload_backend == "disk"
 
+        kv_offload_quantization = str(
+            extra_config.get("kv_offload_quantization", "none")
+        ).lower()
+        if kv_offload_quantization not in VALID_KV_OFFLOAD_QUANTIZATIONS:
+            raise ValueError(
+                f"Unknown kv_offload_quantization {kv_offload_quantization!r}; "
+                f"expected one of {VALID_KV_OFFLOAD_QUANTIZATIONS}"
+            )
+        quantization_buffer_blocks = max(
+            1, int(extra_config.get("quantization_buffer_blocks", 64))
+        )
+        if kv_offload_quantization == "int8":
+            if disk_mode:
+                raise ValueError(
+                    "INT8 KV offload currently supports only the CPU backend"
+                )
+            if not current_platform.is_cuda():
+                raise ValueError("INT8 KV offload currently requires NVIDIA CUDA")
+
         disk_path = extra_config.get("disk_path", None) or None
         disk_capacity_bytes = int(
             extra_config.get("disk_capacity_bytes", 100 * (1024**3))
@@ -139,12 +160,14 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
-            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s",
+            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, "
+            "quantization=%s, disk=%s",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
             "lazy" if lazy_offload else "eager",
             kv_offload_backend,
+            kv_offload_quantization,
             disk_path or "none",
         )
 
@@ -174,6 +197,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 disk_capacity_bytes=disk_capacity_bytes,
                 disk_buffer_slots=disk_buffer_slots,
                 use_page_cache=use_page_cache,
+                kv_offload_quantization=kv_offload_quantization,
+                quantization_buffer_blocks=quantization_buffer_blocks,
             )
 
     # --- Worker-side methods ---

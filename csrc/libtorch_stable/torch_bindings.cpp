@@ -627,6 +627,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "dynamic_scaled_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
       "Tensor!? azp) -> ()");
 
+#ifndef USE_ROCM
+  ops.def(
+      "agent_kv_int8_quantize_pack(Tensor input, Tensor block_ids, "
+      "Tensor! packed_buffer, int payload_offset, int scale_offset) -> ()");
+  ops.def(
+      "agent_kv_int8_unpack_dequantize(Tensor packed_buffer, Tensor block_ids, "
+      "Tensor! output, int payload_offset, int scale_offset) -> ()");
+#endif
+
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
   // scaling. Optional group_m/group_n specify the group shape explicitly;
@@ -702,6 +711,11 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("permute_cols", TORCH_BOX(&permute_cols));
 
 #ifndef USE_ROCM
+  ops.impl("agent_kv_int8_quantize_pack",
+           TORCH_BOX(&agent_kv_int8_quantize_pack));
+  ops.impl("agent_kv_int8_unpack_dequantize",
+           TORCH_BOX(&agent_kv_int8_unpack_dequantize));
+
   // CUTLASS scaled_mm ops
   ops.impl("cutlass_scaled_mm", TORCH_BOX(&cutlass_scaled_mm));
   ops.impl("cutlass_scaled_mm_azp", TORCH_BOX(&cutlass_scaled_mm_azp));

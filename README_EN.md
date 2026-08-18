@@ -506,7 +506,9 @@ vllm serve your-model \
     "kv_role": "kv_both",
     "kv_connector_extra_config": {
       "cpu_bytes_to_use": 8589934592,
-      "lazy_offload": true
+      "lazy_offload": true,
+      "kv_offload_quantization": "int8",
+      "quantization_buffer_blocks": 64
     }
   }'
 ```
@@ -518,6 +520,11 @@ Notes:
 - `cpu_bytes_to_use_per_rank` may explicitly override capacity for each rank.
 - `kv_offload_backend` defaults to `cpu`; existing Simple CPU Offload settings
   can select `disk` instead.
+- `kv_offload_quantization=int8` enables lossy 16-bit floating-point
+  (FP16)/Brain Floating Point 16 (BF16)-to-8-bit integer (INT8) transport; the
+  default is `none`.
+- `quantization_buffer_blocks` sets the maximum blocks in each double-buffered
+  staging slot.
 - AgentKV tier actions currently integrate only with lazy mode. Eager mode
   retains native behavior.
 - Even with the connector configured, native lazy offload remains active when
@@ -572,6 +579,21 @@ Notes:
   in-flight store blocks.
 - Restricted metric labels to bounded engine-owned states and reasons.
 
+### Phase 5: Fused INT8 transport
+
+- Added C++/CUDA fused quantize-and-pack and unpack-and-dequantize kernels.
+- Added one FP32 scale per KV tensor segment and block.
+- Packed scale headers and INT8 payloads into aligned contiguous transfer rows.
+- Stored compressed lower-tier rows in pinned host memory.
+- Pipelined store quantization with Peripheral Component Interconnect Express
+  (PCIe) transfers and load transfers with dequantization on separate
+  low-priority streams.
+- Added two staging slots per direction, protected by CUDA events, so conversion
+  and transfer can overlap.
+- Split transfers larger than a staging slot into chunks while retaining one
+  completion event for the complete batch.
+- Kept the existing lossless Simple CPU Offload path as the default.
+
 ## Current test status
 
 The latest targeted validation on this branch completed with:
@@ -582,6 +604,10 @@ The latest targeted validation on this branch completed with:
 - lifecycle event protocol and endpoint-switch tests: `8 passed`;
 - scheduler-stat serialization and Prometheus mapping tests: `14 passed`;
 - complete Simple CPU Offload scheduler regression: `34 passed`;
+- INT8 packed-layout, validation, and compression-ratio tests: `6 passed`;
+- CUDA kernel and double-buffered end-to-end tests are included; on the current
+  non-NVIDIA CUDA development host they report `4 skipped` and a module-level
+  skip, respectively, and must run in CUDA CI;
 - Ruff static checks passed;
 - Ruff formatting checks passed;
 - `git diff --check` passed;
@@ -592,13 +618,15 @@ Run the targeted tests in a complete vLLM development environment:
 ```bash
 pytest -q tests/v1/agent_kv
 pytest -q tests/v1/simple_kv_offload/test_scheduler.py
+pytest -q tests/v1/simple_kv_offload/test_int8_backend.py
+pytest -q tests/kernels/test_agent_kv_int8_kernels.py
 ```
 
 Run static checks:
 
 ```bash
-uvx ruff check vllm/v1/agent_kv tests/v1/agent_kv
-uvx ruff format --check vllm/v1/agent_kv tests/v1/agent_kv
+uvx ruff check vllm/v1/agent_kv vllm/v1/simple_kv_offload tests/v1/agent_kv
+uvx ruff format --check vllm/v1/agent_kv vllm/v1/simple_kv_offload tests/v1/agent_kv
 git diff --check
 ```
 
@@ -645,6 +673,12 @@ workload calibration.
   lower-tier copy.
 - AgentKV controls admission to a lower tier, while lower-tier victim
   selection remains connector-native.
+- INT8 transport currently supports only NVIDIA CUDA, the CPU backend, and
+  FP16/BF16 KV caches.
+- INT8 is a lossy transport format and requires accuracy evaluation for each
+  target model and workload.
+- Scheduler capacity accounting remains conservative and uses uncompressed
+  block sizes, so saved host memory does not yet increase logical capacity.
 - Low-cardinality Prometheus metrics exist, but a formal dashboard and alert
   thresholds do not.
 - Data-parallel deployments do not yet provide session-affine routing.

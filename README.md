@@ -448,7 +448,9 @@ vllm serve your-model \
     "kv_role": "kv_both",
     "kv_connector_extra_config": {
       "cpu_bytes_to_use": 8589934592,
-      "lazy_offload": true
+      "lazy_offload": true,
+      "kv_offload_quantization": "int8",
+      "quantization_buffer_blocks": 64
     }
   }'
 ```
@@ -458,6 +460,9 @@ vllm serve your-model \
 - `cpu_bytes_to_use` 是整个服务的 host memory 预算，connector 会按 world size 分配到各 rank；
 - 也可以使用 `cpu_bytes_to_use_per_rank` 显式覆盖每个 rank 的容量；
 - `kv_offload_backend` 默认为 `cpu`，也可以按 Simple CPU Offload 的已有配置使用 `disk`；
+- `kv_offload_quantization=int8` 启用有损的 FP16（16 位浮点数）/BF16
+  （Brain Floating Point 16，16 位脑浮点数）到 INT8（8 位整数）压缩传输，默认值 `none`；
+- `quantization_buffer_blocks` 控制每个双缓冲 staging slot 的最大 block 数量；
 - AgentKV 的分层动作目前只接入 lazy 模式；eager 模式保持原生行为；
 - 即使配置 connector，没有 AgentKV owner 时仍执行原生 lazy offload。
 
@@ -502,6 +507,18 @@ vllm serve your-model \
 - 暴露 session、generation、owner hash 和在途 store block 的聚合 gauge；
 - 指标只使用受控的低基数状态与原因，禁止使用上游身份作为 label。
 
+### Phase 5：INT8 fused 压缩传输
+
+- 增加 C++/CUDA fused quantize-and-pack 与 unpack-and-dequantize kernel；
+- 对每个 KV tensor segment 和 block 使用独立 FP32 scale；
+- 将 scale header 和 INT8 payload 写入对齐的连续传输行；
+- 使用 pinned host memory 保存压缩后的低层缓存；
+- Store 使用量化 stream 与 PCIe（Peripheral Component Interconnect Express，
+  高速外设组件互连）传输 stream，Load 使用传输 stream 与反量化 stream；
+- 每个方向使用两个 staging slot，通过 CUDA event 保护复用并重叠转换与传输；
+- 大于 staging slot 的请求自动切分为多个 chunk，完成事件覆盖整个传输批次；
+- 配置默认关闭，现有无损 Simple CPU Offload 路径保持不变。
+
 ## 当前测试状态
 
 本分支最近一次定向验证结果：
@@ -511,6 +528,9 @@ vllm serve your-model \
 - 生命周期事件协议与端点开关测试：`8 passed`；
 - scheduler 指标序列化与 Prometheus 映射测试：`14 passed`；
 - Simple CPU Offload scheduler 完整回归：`34 passed`；
+- INT8 packed layout、参数校验与压缩率测试：`6 passed`；
+- CUDA kernel 与双缓冲端到端测试已加入测试集；当前非 NVIDIA CUDA
+  开发机上分别为 `4 skipped` 和 module-level skip，需要在 CUDA CI 中执行；
 - Ruff 静态检查通过；
 - Ruff 格式检查通过；
 - `git diff --check` 通过；
@@ -521,13 +541,15 @@ vllm serve your-model \
 ```bash
 pytest -q tests/v1/agent_kv
 pytest -q tests/v1/simple_kv_offload/test_scheduler.py
+pytest -q tests/v1/simple_kv_offload/test_int8_backend.py
+pytest -q tests/kernels/test_agent_kv_int8_kernels.py
 ```
 
 执行静态检查：
 
 ```bash
-uvx ruff check vllm/v1/agent_kv tests/v1/agent_kv
-uvx ruff format --check vllm/v1/agent_kv tests/v1/agent_kv
+uvx ruff check vllm/v1/agent_kv vllm/v1/simple_kv_offload tests/v1/agent_kv
+uvx ruff format --check vllm/v1/agent_kv vllm/v1/simple_kv_offload tests/v1/agent_kv
 git diff --check
 ```
 
@@ -564,6 +586,9 @@ label，避免无界基数和租户信息泄露。正式 dashboard 与告警阈�
 - `KEEP` 不预留固定 GPU 容量，也不保证永不驱逐；
 - `DROP` 不主动扫描并立即删除块，只阻止创建新的低层副本；
 - AgentKV 只决定是否向低层 admission，低层内部 victim 仍使用 connector 原生策略；
+- INT8 压缩当前只支持 NVIDIA CUDA、CPU backend 与 FP16/BF16 KV cache；
+- INT8 是有损传输格式，需要在目标模型与 workload 上完成精度评估；
+- scheduler 容量计算仍使用未压缩 block 大小，暂时不会把节省的 host memory 转换为更多逻辑 block；
 - 已提供低基数 Prometheus 指标，但还没有正式 dashboard 与告警阈值；
 - data parallel 部署还没有 session-affine routing；
 - controller 状态当前在 scheduler 进程内存中，不是跨实例持久化控制面；

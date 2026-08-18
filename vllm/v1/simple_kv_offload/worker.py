@@ -12,6 +12,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
+from vllm.v1.simple_kv_offload.int8_backend import Int8DoubleBufferBackend
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -36,6 +37,8 @@ class SimpleCPUOffloadWorker:
         disk_capacity_bytes: int = 0,
         disk_buffer_slots: int = 2,
         use_page_cache: bool = False,
+        kv_offload_quantization: str = "none",
+        quantization_buffer_blocks: int = 64,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -45,6 +48,8 @@ class SimpleCPUOffloadWorker:
         self.disk_buffer_slots = disk_buffer_slots
         self.use_page_cache = use_page_cache
         self.disk_mode = kv_offload_backend == "disk"
+        self.kv_offload_quantization = kv_offload_quantization
+        self.quantization_buffer_blocks = quantization_buffer_blocks
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -55,7 +60,9 @@ class SimpleCPUOffloadWorker:
         self.load_stream: torch.cuda.Stream | None = None
         self.store_stream: torch.cuda.Stream | None = None
 
-        self._backend: DmaCopyBackend | DiskBackend | None = None
+        self._backend: DmaCopyBackend | DiskBackend | Int8DoubleBufferBackend | None = (
+            None
+        )
 
         # Ordered (event_idx, Event). Events pre-allocated on main thread.
         self._load_events: list[tuple[int, torch.Event]] = []
@@ -113,6 +120,14 @@ class SimpleCPUOffloadWorker:
         seen_ptrs: dict[int, tuple[str, torch.Tensor]] = {}
         for name, value in kv_caches.items():
             tensor = _repr_tensor(value)
+            if self.kv_offload_quantization == "int8" and tensor.dtype not in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                raise ValueError(
+                    "INT8 offload supports only FP16 or BF16 KV cache tensors; "
+                    f"{name!r} uses {tensor.dtype}"
+                )
             ptr = tensor.untyped_storage().data_ptr()
             if ptr not in seen_ptrs:
                 seen_ptrs[ptr] = (name, tensor)
@@ -128,24 +143,39 @@ class SimpleCPUOffloadWorker:
         # must be an outer segment dim (e.g. the K/V dim of size 2). A less
         # hacky way is to update the interface with the layout.
         unique_gpu_caches: dict[str, torch.Tensor] = {}
+        int8_gpu_caches: dict[str, torch.Tensor] = {}
         for name, tensor in seen_ptrs.values():
             storage = tensor.untyped_storage()
             raw = torch.empty(0, dtype=torch.int8, device=self.device).set_(
                 storage, 0, (storage.nbytes(),)
             )
             el = tensor.element_size()
+            typed_raw: torch.Tensor | None = None
+            if self.kv_offload_quantization == "int8":
+                typed_raw = torch.empty(0, dtype=tensor.dtype, device=self.device).set_(
+                    storage, 0, (storage.nbytes() // el,)
+                )
             page_size_bytes = storage.nbytes() // num_blocks
             outer_dims = [
                 d for d in range(tensor.ndim) if tensor.stride(d) * el > page_size_bytes
             ]
             if not outer_dims:
                 unique_gpu_caches[name] = raw.view(num_blocks, -1)
+                if typed_raw is not None:
+                    int8_gpu_caches[name] = typed_raw.view(num_blocks, -1)
             else:
                 seg_stride = tensor.stride(outer_dims[0]) * el
                 for idx in range(tensor.shape[outer_dims[0]]):
                     offset = idx * seg_stride
                     chunk = raw[offset : offset + seg_stride]
-                    unique_gpu_caches[f"{name}.{idx}"] = chunk.view(num_blocks, -1)
+                    segment_name = f"{name}.{idx}"
+                    unique_gpu_caches[segment_name] = chunk.view(num_blocks, -1)
+                    if typed_raw is not None:
+                        typed_offset = offset // el
+                        typed_chunk = typed_raw[
+                            typed_offset : typed_offset + seg_stride // el
+                        ]
+                        int8_gpu_caches[segment_name] = typed_chunk.view(num_blocks, -1)
 
         # Compute per-tensor bytes_per_block. Tensors may have different
         # page_size_bytes (e.g., UniformTypeKVCacheSpecs with varying head_size).
@@ -166,7 +196,12 @@ class SimpleCPUOffloadWorker:
         if self.disk_mode:
             self._init_disk_mode(unique_gpu_caches, total_bytes_per_block, self.device)
         else:
-            self._init_cpu_mode(unique_gpu_caches, total_bytes_per_block, self.device)
+            self._init_cpu_mode(
+                unique_gpu_caches,
+                int8_gpu_caches,
+                total_bytes_per_block,
+                self.device,
+            )
 
     def _init_disk_mode(
         self,
@@ -202,9 +237,35 @@ class SimpleCPUOffloadWorker:
     def _init_cpu_mode(
         self,
         unique_gpu_caches: dict[str, torch.Tensor],
+        int8_gpu_caches: dict[str, torch.Tensor],
         total_bytes_per_block: int,
         device: torch.device,
     ) -> None:
+        if self.kv_offload_quantization == "int8":
+            if not PIN_MEMORY:
+                raise RuntimeError("INT8 KV offload requires pinned host memory")
+            backend = Int8DoubleBufferBackend(self.quantization_buffer_blocks)
+            backend.init(
+                int8_gpu_caches,
+                self.num_cpu_blocks,
+                device,
+                self.load_stream,
+                self.store_stream,
+            )
+            assert backend.layout is not None and backend.cpu_cache is not None
+            self.cpu_kv_caches = {"agent_kv_int8": backend.cpu_cache}
+            self._backend = backend
+            logger.info(
+                "SimpleCPUOffloadWorker [CPU/INT8]: %d tensors, %d blocks, "
+                "%d bytes/block (%.3f of FP16/BF16), double_buffer=%d",
+                len(int8_gpu_caches),
+                self.num_cpu_blocks,
+                backend.layout.row_bytes,
+                backend.layout.compression_ratio,
+                self.quantization_buffer_blocks,
+            )
+            return
+
         logger.info(
             "SimpleCPUOffloadWorker [CPU]: %d tensors, %d CPU blocks (%.2f GB)",
             len(unique_gpu_caches),

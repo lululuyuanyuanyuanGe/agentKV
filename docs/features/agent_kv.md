@@ -61,7 +61,7 @@ X-AgentKV-Branch-ID: main
 
 Requests that provide no AgentKV-specific fields retain native vLLM behavior.
 Partially specified AgentKV identities are rejected instead of being silently
-mis-associated.
+incorrectly associated.
 
 ## Lifecycle events
 
@@ -174,7 +174,9 @@ Example connector configuration:
   "kv_role": "kv_both",
   "kv_connector_extra_config": {
     "cpu_bytes_to_use": 8589934592,
-    "lazy_offload": true
+    "lazy_offload": true,
+    "kv_offload_quantization": "int8",
+    "quantization_buffer_blocks": 64
   }
 }
 ```
@@ -191,6 +193,29 @@ AgentKV state changes reset the lazy scan cursor so a previously skipped block
 can be reconsidered. Time-limited retention records the earliest deadline and
 does the same when that deadline expires. Capacity exhaustion is best effort:
 the scheduler never blocks inference waiting for lower-tier space.
+
+## Fused 8-bit integer (INT8) transport
+
+`kv_offload_quantization=int8` enables an optional lossy transport path for
+16-bit floating-point (FP16) and Brain Floating Point 16 (BF16) cache blocks on
+NVIDIA Compute Unified Device Architecture (CUDA). Each packed row contains an
+aligned 32-bit floating-point (FP32) scale header followed by contiguous INT8
+payloads for every unique KV tensor segment. Quantization uses one symmetric
+scale per block and segment.
+
+The store pipeline waits for model computation, quantizes into one of two GPU
+staging slots, and copies the packed row to persistent pinned host memory. The
+quantization and Peripheral Component Interconnect Express (PCIe) streams are
+independent, so quantizing the next chunk can overlap transfer of the previous
+chunk. The load pipeline performs the inverse:
+one stream copies packed rows into a staging slot while another waits on a CUDA
+event and runs fused unpack-and-dequantize into the destination KV blocks.
+
+Transfers larger than `quantization_buffer_blocks` are chunked and alternate
+between the two slots. Slot completion events prevent reuse while an earlier
+transfer or kernel is still in flight. The final event is recorded on the
+ordered transfer or dequantization stream and represents completion of the
+entire logical operation.
 
 ## Observability
 
@@ -221,5 +246,8 @@ values to avoid unbounded cardinality and identity leakage.
 - Lifecycle endpoints are development endpoints and require an authenticated,
   trusted gateway before production use.
 - Data-parallel deployments do not yet provide session-affine request routing.
+- INT8 transport currently supports only NVIDIA CUDA, CPU offload, and FP16 or
+  BF16 cache storage. It is lossy and requires model-specific evaluation.
+- Offload capacity accounting remains based on the uncompressed block size.
 - A production dashboard, alert thresholds, and disabled-versus-enabled
   scheduler overhead baseline have not yet been established.

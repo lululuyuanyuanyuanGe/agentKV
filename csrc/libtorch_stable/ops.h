@@ -47,6 +47,17 @@ torch::stable::Tensor permute_cols(torch::stable::Tensor const& A,
                                    torch::stable::Tensor const& perm);
 
 #ifndef USE_ROCM
+void agent_kv_int8_quantize_pack(const torch::stable::Tensor& input,
+                                 const torch::stable::Tensor& block_ids,
+                                 torch::stable::Tensor& packed_buffer,
+                                 int64_t payload_offset, int64_t scale_offset);
+
+void agent_kv_int8_unpack_dequantize(const torch::stable::Tensor& packed_buffer,
+                                     const torch::stable::Tensor& block_ids,
+                                     torch::stable::Tensor& output,
+                                     int64_t payload_offset,
+                                     int64_t scale_offset);
+
 bool cutlass_scaled_mm_supports_fp8(int64_t cuda_device_capability);
 bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability);
 bool cutlass_group_gemm_supported(int64_t cuda_device_capability);
