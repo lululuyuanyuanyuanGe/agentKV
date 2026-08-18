@@ -19,6 +19,7 @@ from vllm.v1.agent_kv.action import (
     AgentKVPressureLevel,
     plan_agent_kv_cache_actions,
 )
+from vllm.v1.agent_kv.metrics import AgentKVMetrics, AgentKVStats
 from vllm.v1.agent_kv.ownership import (
     AgentKVGenerationKey,
     AgentKVOwnershipIndex,
@@ -98,14 +99,21 @@ class AgentKVController:
     a request finishes.
     """
 
-    def __init__(self, max_sessions: int = _DEFAULT_MAX_SESSIONS) -> None:
+    def __init__(
+        self,
+        max_sessions: int = _DEFAULT_MAX_SESSIONS,
+        *,
+        enabled: bool = True,
+    ) -> None:
         if max_sessions < 1:
             raise ValueError("max_sessions must be greater than or equal to 1")
         self.max_sessions = max_sessions
+        self.enabled = enabled
         self._sessions: OrderedDict[tuple[str, str], _SessionRecord] = OrderedDict()
         self._request_index: dict[str, tuple[tuple[str, str], str, int]] = {}
         self._ownership = AgentKVOwnershipIndex()
         self._policy_revision = 0
+        self.metrics = AgentKVMetrics()
 
     @staticmethod
     def _now_ms() -> int:
@@ -113,6 +121,13 @@ class AgentKVController:
 
     def _bump_policy_revision(self) -> None:
         self._policy_revision += 1
+        self.metrics.record_policy_revision()
+
+    def _require_enabled(self) -> None:
+        if not self.enabled:
+            raise ValueError(
+                "AgentKV is disabled; set VLLM_ENABLE_AGENT_KV=1 before startup"
+            )
 
     def _get_or_create_session(
         self, namespace: str, session_id: str
@@ -186,6 +201,7 @@ class AgentKVController:
         self, metadata: AgentKVRequestMetadata, request_id: str
     ) -> None:
         """Register one inference request as the active session generation."""
+        self._require_enabled()
         key, session = self._get_or_create_session(
             metadata.namespace, metadata.session_id
         )
@@ -211,6 +227,8 @@ class AgentKVController:
 
     def finish_request(self, request_id: str, block_hashes: Iterable[bytes]) -> None:
         """Persist the content identity before scheduler request state is freed."""
+        if not self.enabled:
+            return
         request_ref = self._request_index.pop(request_id, None)
         if request_ref is None:
             return
@@ -246,6 +264,7 @@ class AgentKVController:
 
     def apply_event(self, event: AgentKVEvent) -> dict[str, object]:
         """Apply one idempotent, ordered lifecycle event."""
+        self._require_enabled()
         key, session = self._get_or_create_session(event.namespace, event.session_id)
 
         if event.event_id in session.seen_event_ids:
@@ -303,7 +322,22 @@ class AgentKVController:
 
     def has_cache_owners(self) -> bool:
         """Return whether policy evaluation could affect cache ordering."""
-        return bool(self._ownership)
+        return self.enabled and bool(self._ownership)
+
+    def drain_metrics(self) -> AgentKVStats | None:
+        """Return interval telemetry without exposing lifecycle identities."""
+        if not self.enabled:
+            return None
+        num_generations = sum(
+            len(branch.generations)
+            for session in self._sessions.values()
+            for branch in session.branches.values()
+        )
+        return self.metrics.drain(
+            num_sessions=len(self._sessions),
+            num_generations=num_generations,
+            num_owned_hashes=self._ownership.num_hashes,
+        )
 
     def get_block_owners(self, block_hash: bytes) -> frozenset[AgentKVGenerationKey]:
         """Return generation identities associated with a content hash."""
@@ -474,6 +508,7 @@ class AgentKVController:
         session: _SessionRecord,
         event: AgentKVEvent,
     ) -> dict[str, object]:
+        self.metrics.record_event(event.event_type, status)
         snapshot = self.get_session_snapshot(
             event.namespace, event.session_id, event.branch_id
         )

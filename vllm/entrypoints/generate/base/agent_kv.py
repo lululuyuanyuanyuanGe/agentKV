@@ -5,6 +5,7 @@
 
 from collections.abc import Mapping
 
+import vllm.envs as envs
 from vllm.v1.agent_kv.protocol import (
     AgentKVRequestMetadata,
     parse_agent_kv_request_metadata,
@@ -44,6 +45,9 @@ def get_agent_kv_request_metadata(
         value is None for value in (namespace, generation, branch_id, protocol_version)
     ):
         return None
+
+    if not envs.VLLM_ENABLE_AGENT_KV:
+        raise ValueError("AgentKV request metadata requires VLLM_ENABLE_AGENT_KV=1")
 
     return parse_agent_kv_request_metadata(
         session_id=session_id,

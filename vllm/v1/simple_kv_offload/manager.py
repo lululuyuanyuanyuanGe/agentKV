@@ -22,6 +22,7 @@ from vllm.v1.agent_kv.action import (
     AgentKVPressure,
     AgentKVPressureLevel,
 )
+from vllm.v1.agent_kv.metrics import AgentKVMetrics
 from vllm.v1.core.block_pool import BlockPool, FreeCachedBlockSnapshot
 from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
@@ -155,6 +156,7 @@ class SimpleCPUOffloadScheduler:
         self._agent_kv_action_planner: AgentKVActionPlanner | None = None
         self._agent_kv_action_validator: AgentKVActionValidator | None = None
         self._agent_kv_action_policy_enabled: AgentKVActionPolicyEnabled | None = None
+        self._agent_kv_metrics: AgentKVMetrics | None = None
         self._agent_kv_policy_revision: int | None = None
         self._agent_kv_reconsider_at_ms: int | None = None
         self._prepared_agent_kv_actions: dict[int, AgentKVCacheAction] = {}
@@ -268,11 +270,13 @@ class SimpleCPUOffloadScheduler:
         planner: AgentKVActionPlanner,
         validator: AgentKVActionValidator,
         enabled: AgentKVActionPolicyEnabled,
+        metrics: AgentKVMetrics | None = None,
     ) -> None:
         """Bind AgentKV tier actions used only by lazy offload mode."""
         self._agent_kv_action_planner = planner
         self._agent_kv_action_validator = validator
         self._agent_kv_action_policy_enabled = enabled
+        self._agent_kv_metrics = metrics
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -456,6 +460,7 @@ class SimpleCPUOffloadScheduler:
                 store_cpu,
                 actions if any(action is not None for action in actions) else (),
             )
+            self._update_agent_kv_inflight_store_blocks()
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
@@ -537,6 +542,8 @@ class SimpleCPUOffloadScheduler:
         try:
             policy_enabled = enabled()
         except Exception:
+            if self._agent_kv_metrics is not None:
+                self._agent_kv_metrics.record_fallback("policy_check_error")
             logger.exception(
                 "AgentKV action policy check failed; using native lazy store"
             )
@@ -555,6 +562,8 @@ class SimpleCPUOffloadScheduler:
         try:
             probe = planner((), pressure)
         except Exception:
+            if self._agent_kv_metrics is not None:
+                self._agent_kv_metrics.record_fallback("planner_probe_error")
             logger.exception("AgentKV action planner failed; using native lazy store")
             return self._prepare_native_lazy_store_specs(
                 gpu_pool,
@@ -568,11 +577,16 @@ class SimpleCPUOffloadScheduler:
             and now_ms >= self._agent_kv_reconsider_at_ms
         )
         if policy_changed or reconsider_due:
+            if self._cursor is not None and self._agent_kv_metrics is not None:
+                reason = "policy_revision" if policy_changed else "retain_deadline"
+                self._agent_kv_metrics.record_cursor_reset(reason)
             self._cursor = None
             self._agent_kv_policy_revision = probe.policy_revision
             self._agent_kv_reconsider_at_ms = None
 
         if num_cpu_free <= 0:
+            if self._agent_kv_metrics is not None:
+                self._agent_kv_metrics.record_fallback("offload_capacity_exhausted")
             return [], [], []
 
         nodes = []
@@ -600,7 +614,11 @@ class SimpleCPUOffloadScheduler:
                 plan.actions,
                 snapshots,
             )
+            if self._agent_kv_metrics is not None:
+                self._agent_kv_metrics.record_actions(plan.actions)
         except Exception:
+            if self._agent_kv_metrics is not None:
+                self._agent_kv_metrics.record_fallback("action_plan_error")
             logger.exception("AgentKV action planner failed; using native lazy store")
             return self._prepare_native_lazy_store_specs(
                 gpu_pool,
@@ -906,7 +924,12 @@ class SimpleCPUOffloadScheduler:
             transfer = self._abandoned_store_event_to_blocks.pop(event_idx, None)
             if transfer is None:
                 return  # guard stale events from before a reset() call
+            if self._agent_kv_metrics is not None and transfer.agent_kv_actions:
+                self._agent_kv_metrics.record_offload_result(
+                    "abandoned", len(transfer.gpu_block_ids)
+                )
             self._release_transfer_refs(transfer)
+            self._update_agent_kv_inflight_store_blocks()
             return
 
         if not self._lazy_mode:
@@ -920,6 +943,14 @@ class SimpleCPUOffloadScheduler:
             )
         if rejected.gpu_block_ids:
             self._release_transfer_refs(rejected)
+        if self._agent_kv_metrics is not None and transfer.agent_kv_actions:
+            self._agent_kv_metrics.record_offload_result(
+                "accepted", len(accepted.gpu_block_ids)
+            )
+            self._agent_kv_metrics.record_offload_result(
+                "invalidated", len(rejected.gpu_block_ids)
+            )
+        self._update_agent_kv_inflight_store_blocks()
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
             event_idx,
@@ -963,6 +994,8 @@ class SimpleCPUOffloadScheduler:
                 try:
                     valid = validator(action)
                 except Exception:
+                    if self._agent_kv_metrics is not None:
+                        self._agent_kv_metrics.record_fallback("validator_error")
                     logger.exception(
                         "AgentKV action validation failed; discarding offload"
                     )
@@ -1018,6 +1051,22 @@ class SimpleCPUOffloadScheduler:
         """Return True if there are in-flight store transfers."""
         return bool(
             self._store_event_to_blocks or self._abandoned_store_event_to_blocks
+        )
+
+    def _update_agent_kv_inflight_store_blocks(self) -> None:
+        metrics = self._agent_kv_metrics
+        if metrics is None:
+            return
+        transfers = (
+            *self._store_event_to_blocks.values(),
+            *self._abandoned_store_event_to_blocks.values(),
+        )
+        metrics.set_inflight_store_blocks(
+            sum(
+                len(transfer.gpu_block_ids)
+                for transfer in transfers
+                if transfer.agent_kv_actions
+            )
         )
 
     def request_finished(
@@ -1135,6 +1184,7 @@ class SimpleCPUOffloadScheduler:
 
         self._abandoned_store_event_to_blocks.update(self._store_event_to_blocks)
         self._store_event_to_blocks.clear()
+        self._update_agent_kv_inflight_store_blocks()
         self._in_flight_store_gpu_blocks.clear()
 
         # Loads that have not been sent to the worker cannot have running DMA.

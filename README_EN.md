@@ -185,6 +185,16 @@ for at-least-once delivery.
 
 An inference request opting into AgentKV supplies the following identity:
 
+The experimental feature must be explicitly enabled before server startup:
+
+```bash
+export VLLM_ENABLE_AGENT_KV=1
+```
+
+The default is `0`. With the switch disabled, requests without AgentKV fields
+retain native vLLM behavior, while requests carrying AgentKV fields are
+rejected so callers cannot mistakenly assume that lifecycle policy is active.
+
 | Field | Hypertext Transfer Protocol (HTTP) header | Required | Constraint |
 | --- | --- | --- | --- |
 | Session | `X-Session-ID` | Yes | Stable, non-empty, at most 256 characters |
@@ -233,9 +243,10 @@ POST /v1/agent-kv/events
 Content-Type: application/json
 ```
 
-Enable the development endpoint with:
+Enable both the experimental feature and the development endpoint with:
 
 ```bash
+export VLLM_ENABLE_AGENT_KV=1
 export VLLM_SERVER_DEV_MODE=1
 ```
 
@@ -485,6 +496,7 @@ instead of treating the system Python environment as the project environment.
 ### 3. Enable prefix caching and lazy offload
 
 ```bash
+export VLLM_ENABLE_AGENT_KV=1
 export VLLM_SERVER_DEV_MODE=1
 
 vllm serve your-model \
@@ -547,12 +559,28 @@ Notes:
 - Added safe handling for exhausted capacity, policy exceptions, and invalid
   plans.
 
+### Phase 4: Observability and safety switch
+
+- Added the default-off `VLLM_ENABLE_AGENT_KV` experimental switch.
+- Preserved native behavior for requests without AgentKV metadata and rejected
+  metadata-bearing requests while the feature is disabled.
+- Protected the development event endpoint with both the experimental switch
+  and `VLLM_SERVER_DEV_MODE`.
+- Added scheduler telemetry for events, actions, offload results, native
+  fallbacks, cursor rescans, and policy revisions.
+- Added aggregate gauges for sessions, generations, owned hashes, and
+  in-flight store blocks.
+- Restricted metric labels to bounded engine-owned states and reasons.
+
 ## Current test status
 
 The latest targeted validation on this branch completed with:
 
-- AgentKV protocol, ownership, controller, eviction, and action tests:
-  `36 passed`;
+- AgentKV protocol, ownership, controller, eviction, action, and metric tests:
+  `39 passed`;
+- request-entrypoint and safety-switch tests: `8 passed`;
+- lifecycle event protocol and endpoint-switch tests: `8 passed`;
+- scheduler-stat serialization and Prometheus mapping tests: `14 passed`;
 - complete Simple CPU Offload scheduler regression: `34 passed`;
 - Ruff static checks passed;
 - Ruff formatting checks passed;
@@ -578,9 +606,34 @@ Targeted unit tests validate the current policy and integration contract. They
 do not replace real-model, real-GPU, long-running pressure, multi-worker,
 process-failure, or cross-node testing.
 
+## Observability
+
+AgentKV statistics flow through scheduler stats into the existing Prometheus
+export path:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `vllm:agent_kv_events` | Counter | Lifecycle events by event type and processing result |
+| `vllm:agent_kv_cache_actions` | Counter | Cache plans by action and bounded reason |
+| `vllm:agent_kv_offload_results` | Counter | Accepted, invalidated, or abandoned asynchronous offload blocks |
+| `vllm:agent_kv_fallbacks` | Counter | Native fallbacks by bounded reason |
+| `vllm:agent_kv_cursor_resets` | Counter | Lazy scan cursor resets by bounded reason |
+| `vllm:agent_kv_policy_revisions` | Counter | Lifecycle policy revision changes |
+| `vllm:agent_kv_sessions` | Gauge | Currently tracked sessions |
+| `vllm:agent_kv_generations` | Gauge | Currently tracked generations |
+| `vllm:agent_kv_owned_hashes` | Gauge | Content hashes with an AgentKV owner |
+| `vllm:agent_kv_inflight_store_blocks` | Gauge | AgentKV-governed blocks in lower-tier stores |
+
+Session, event, branch, request, namespace, and other upstream identities are
+never Prometheus labels. This avoids unbounded cardinality and tenant-identity
+leakage. A production dashboard and alert thresholds still require real
+workload calibration.
+
 ## Current limitations
 
-- The lifecycle endpoint is available only with
+- AgentKV is disabled by default and requires
+  `VLLM_ENABLE_AGENT_KV=1`.
+- The lifecycle endpoint is available only when the feature is enabled and
   `VLLM_SERVER_DEV_MODE=1`.
 - The endpoint does not yet provide production-grade authentication,
   authorization, rate limiting, or auditing.
@@ -592,7 +645,8 @@ process-failure, or cross-node testing.
   lower-tier copy.
 - AgentKV controls admission to a lower tier, while lower-tier victim
   selection remains connector-native.
-- Prometheus metrics and a formal low-cardinality dashboard do not yet exist.
+- Low-cardinality Prometheus metrics exist, but a formal dashboard and alert
+  thresholds do not.
 - Data-parallel deployments do not yet provide session-affine routing.
 - Controller state is scheduler-process memory, not a persistent
   cross-instance control plane.
@@ -603,25 +657,7 @@ process-failure, or cross-node testing.
 
 ## Roadmap
 
-### Next: observability and safety switches
-
-The next phase should add low-cardinality metrics. Session, event, branch, and
-request identities must never be Prometheus labels.
-
-Planned aggregates include:
-
-- received, accepted, duplicate, and stale lifecycle events;
-- `DEFAULT`, `KEEP`, `OFFLOAD`, and `DROP` actions;
-- successful offloads, invalidated async results, capacity exhaustion, and
-  native fallbacks;
-- policy revision changes and cursor rescans;
-- aggregate session, generation, owned-hash, and in-flight store counts;
-- scheduler-overhead baselines with AgentKV disabled.
-
-This phase should also add an explicit experimental switch, configuration
-validation, and production endpoint protection guidance.
-
-### Then: end-to-end and performance validation
+### Next: end-to-end and performance validation
 
 - End-to-end identity propagation from HTTP request to cache ownership.
 - Complete `SUSPEND -> OFFLOAD -> cache-hit load` behavior.

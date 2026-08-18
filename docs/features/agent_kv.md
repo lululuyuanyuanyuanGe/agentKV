@@ -16,6 +16,19 @@ Upstream clients must never send prompt text, model output, tool arguments,
 tool results, physical cache block identifiers, or cache hashes through this
 protocol.
 
+## Enablement and safe fallback
+
+AgentKV is disabled by default. Enable it explicitly before starting vLLM:
+
+```bash
+export VLLM_ENABLE_AGENT_KV=1
+```
+
+When disabled, requests without AgentKV metadata retain native vLLM behavior.
+A request carrying AgentKV metadata is rejected, and the lifecycle route is not
+registered. This prevents a caller from assuming that lifecycle policy is
+active when the server is not configured for it.
+
 ## Inference request identity
 
 An inference request opts in to AgentKV by providing all required headers:
@@ -52,7 +65,8 @@ mis-associated.
 
 ## Lifecycle events
 
-The development endpoint is available when `VLLM_SERVER_DEV_MODE=1`:
+The development endpoint is available when both
+`VLLM_ENABLE_AGENT_KV=1` and `VLLM_SERVER_DEV_MODE=1`:
 
 ```http
 POST /v1/agent-kv/events
@@ -178,6 +192,23 @@ can be reconsidered. Time-limited retention records the earliest deadline and
 does the same when that deadline expires. Capacity exhaustion is best effort:
 the scheduler never blocks inference waiting for lower-tier space.
 
+## Observability
+
+Scheduler statistics export the following Prometheus metrics:
+
+- `vllm:agent_kv_events` by event type and status;
+- `vllm:agent_kv_cache_actions` by action and bounded reason;
+- `vllm:agent_kv_offload_results` by completion result;
+- `vllm:agent_kv_fallbacks` by bounded reason;
+- `vllm:agent_kv_cursor_resets` by bounded reason;
+- `vllm:agent_kv_policy_revisions`;
+- aggregate gauges for sessions, generations, owned hashes, and in-flight
+  lower-tier store blocks.
+
+Session, event, branch, request, namespace, and other upstream identities are
+not metric labels. The implementation uses only bounded engine-owned label
+values to avoid unbounded cardinality and identity leakage.
+
 ## Current limitations
 
 - Tier actions currently integrate only with `SimpleCPUOffloadConnector` in
@@ -190,5 +221,5 @@ the scheduler never blocks inference waiting for lower-tier space.
 - Lifecycle endpoints are development endpoints and require an authenticated,
   trusted gateway before production use.
 - Data-parallel deployments do not yet provide session-affine request routing.
-- Prometheus labels must not contain session, event, branch, or request
-  identities because those values have unbounded cardinality.
+- A production dashboard, alert thresholds, and disabled-versus-enabled
+  scheduler overhead baseline have not yet been established.

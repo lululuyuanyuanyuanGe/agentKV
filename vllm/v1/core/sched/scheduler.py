@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -89,7 +90,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
-        self.agent_kv_controller = AgentKVController()
+        self.agent_kv_controller = AgentKVController(enabled=envs.VLLM_ENABLE_AGENT_KV)
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -290,6 +291,7 @@ class Scheduler(SchedulerInterface):
                 self.agent_kv_controller.plan_cache_actions,
                 self.agent_kv_controller.validate_cache_action,
                 self.agent_kv_controller.has_cache_owners,
+                self.agent_kv_controller.metrics,
             )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -2449,7 +2451,7 @@ class Scheduler(SchedulerInterface):
         )
 
     def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
-        """Record lifecycle metadata without changing cache behavior."""
+        """Apply lifecycle metadata used by AgentKV cache policy hooks."""
         return self.agent_kv_controller.apply_event(event)
 
     def reset_prefix_cache(
@@ -2558,6 +2560,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
+            agent_kv_stats=self.agent_kv_controller.drain_metrics(),
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )

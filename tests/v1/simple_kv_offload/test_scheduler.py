@@ -317,6 +317,7 @@ def bind_agent_kv_controller(
         controller.plan_cache_actions,
         controller.validate_cache_action,
         controller.has_cache_owners,
+        controller.metrics,
     )
 
 
@@ -591,6 +592,10 @@ def test_agent_kv_discards_lazy_offload_invalidated_by_resume() -> None:
 
     assert meta.store_event >= 0
     assert len(meta.store_gpu_blocks) == 2
+    planned_stats = controller.drain_metrics()
+    assert planned_stats is not None
+    assert planned_stats.action_counts == {"offload": {"suspended": 2}}
+    assert planned_stats.num_inflight_store_blocks == 2
 
     controller.apply_event(
         AgentKVEvent(
@@ -605,6 +610,10 @@ def test_agent_kv_discards_lazy_offload_invalidated_by_resume() -> None:
         )
     )
     simulate_store_completion(sched, meta.store_event)
+    completed_stats = controller.drain_metrics()
+    assert completed_stats is not None
+    assert completed_stats.offload_result_counts == {"invalidated": 2}
+    assert completed_stats.num_inflight_store_blocks == 0
 
     for block_hash in request.block_hashes:
         cache_key = make_block_hash_with_group_id(block_hash, 0)

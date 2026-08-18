@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+from fastapi import FastAPI
 from pydantic import ValidationError
 
+from vllm.entrypoints.serve.dev.agent_kv.api_router import attach_router
 from vllm.entrypoints.serve.dev.agent_kv.protocol import AgentKVEventRequest
 from vllm.v1.agent_kv.protocol import AgentKVEventType
 
@@ -57,3 +59,25 @@ def test_event_request_rejects_invalid_contract_values(
 
     with pytest.raises(ValidationError):
         AgentKVEventRequest.model_validate(data)
+
+
+def test_event_route_requires_agent_kv_enable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_AGENT_KV", "0")
+    app = FastAPI()
+
+    attach_router(app)
+
+    assert "/v1/agent-kv/events" not in app.openapi()["paths"]
+
+
+def test_event_route_is_attached_when_agent_kv_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_AGENT_KV", "1")
+    app = FastAPI()
+
+    attach_router(app)
+
+    assert "/v1/agent-kv/events" in app.openapi()["paths"]

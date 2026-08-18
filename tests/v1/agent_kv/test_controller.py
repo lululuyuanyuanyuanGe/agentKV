@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+import pytest
+
 from vllm.v1.agent_kv.action import (
     AgentKVCacheActionType,
     AgentKVPressure,
@@ -315,3 +317,33 @@ def test_native_store_action_is_invalidated_when_block_gains_an_owner() -> None:
     controller.finish_request("new-owner", [b"shared-hash"])
 
     assert not controller.validate_cache_action(action)
+
+
+def test_controller_metrics_report_event_results_and_aggregate_sizes() -> None:
+    controller = AgentKVController()
+    controller.register_request(make_metadata(1), "request-1")
+    controller.finish_request("request-1", [b"hash-a", b"hash-b"])
+    event = make_event("suspend", 1, AgentKVEventType.SUSPEND, 1)
+
+    controller.apply_event(event)
+    controller.apply_event(event)
+    stats = controller.drain_metrics()
+
+    assert stats is not None
+    assert stats.event_counts == {"SUSPEND": {"accepted": 1, "duplicate": 1}}
+    assert stats.policy_revisions == 3
+    assert stats.num_sessions == 1
+    assert stats.num_generations == 1
+    assert stats.num_owned_hashes == 2
+
+
+def test_disabled_controller_rejects_agent_kv_state() -> None:
+    controller = AgentKVController(enabled=False)
+
+    with pytest.raises(ValueError, match="VLLM_ENABLE_AGENT_KV=1"):
+        controller.register_request(make_metadata(1), "request-1")
+    with pytest.raises(ValueError, match="VLLM_ENABLE_AGENT_KV=1"):
+        controller.apply_event(make_event("suspend", 1, AgentKVEventType.SUSPEND, 1))
+
+    assert not controller.has_cache_owners()
+    assert controller.drain_metrics() is None

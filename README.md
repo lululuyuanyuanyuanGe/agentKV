@@ -145,6 +145,15 @@ tenant-a / session-42 / main / generation 8  -> 工具结果返回后恢复并�
 
 启用 AgentKV 的推理请求需要提供以下信息：
 
+服务启动前必须显式设置实验开关：
+
+```bash
+export VLLM_ENABLE_AGENT_KV=1
+```
+
+默认值为 `0`。开关关闭时，不带 AgentKV 字段的请求继续保持原生 vLLM 行为；带有
+AgentKV 字段的请求会被明确拒绝，避免上游误以为生命周期策略已经生效。
+
 | 字段 | HTTP（Hypertext Transfer Protocol，超文本传输协议）Header | 必需 | 约束 |
 | --- | --- | --- | --- |
 | Session | `X-Session-ID` | 是 | 稳定、非空、不超过 256 个字符 |
@@ -191,9 +200,10 @@ POST /v1/agent-kv/events
 Content-Type: application/json
 ```
 
-启动开发端点需要设置：
+启动开发端点需要同时设置实验开关和开发模式：
 
 ```bash
+export VLLM_ENABLE_AGENT_KV=1
 export VLLM_SERVER_DEV_MODE=1
 ```
 
@@ -428,6 +438,7 @@ git checkout agent-kv/lifecycle-protocol
 ### 3. 启用 prefix cache 与 lazy offload
 
 ```bash
+export VLLM_ENABLE_AGENT_KV=1
 export VLLM_SERVER_DEV_MODE=1
 
 vllm serve your-model \
@@ -482,11 +493,23 @@ vllm serve your-model \
 - 实现异步 store 完成时的动作重新校验；
 - 对容量不足、策略异常和无效计划做安全处理。
 
+### Phase 4：可观测性与安全开关
+
+- 增加默认关闭的 `VLLM_ENABLE_AGENT_KV` 实验开关；
+- 开关关闭时保持无 AgentKV 元数据请求的原生行为，并拒绝误带元数据的请求；
+- 开发事件端点同时受实验开关和 `VLLM_SERVER_DEV_MODE` 保护；
+- 将事件、动作、卸载结果、原生回退、游标重扫和策略版本变化接入调度指标；
+- 暴露 session、generation、owner hash 和在途 store block 的聚合 gauge；
+- 指标只使用受控的低基数状态与原因，禁止使用上游身份作为 label。
+
 ## 当前测试状态
 
 本分支最近一次定向验证结果：
 
-- AgentKV 协议、所有权、控制器、驱逐与动作测试：`36 passed`；
+- AgentKV 协议、所有权、控制器、驱逐、动作与指标测试：`39 passed`；
+- 请求入口与安全开关测试：`8 passed`；
+- 生命周期事件协议与端点开关测试：`8 passed`；
+- scheduler 指标序列化与 Prometheus 映射测试：`14 passed`；
 - Simple CPU Offload scheduler 完整回归：`34 passed`；
 - Ruff 静态检查通过；
 - Ruff 格式检查通过；
@@ -511,16 +534,37 @@ git diff --check
 定向单元测试只能证明策略和集成路径符合当前设计，不替代真实模型、真实 GPU、长时间压力、
 多 worker、进程故障和跨节点部署测试。
 
+## 可观测性
+
+AgentKV 统计随 scheduler stats 进入现有 Prometheus 导出链路：
+
+| 指标 | 类型 | 含义 |
+| --- | --- | --- |
+| `vllm:agent_kv_events` | Counter | 按事件类型与处理结果统计生命周期事件 |
+| `vllm:agent_kv_cache_actions` | Counter | 按动作与受控原因统计缓存计划 |
+| `vllm:agent_kv_offload_results` | Counter | 统计接受、失效或放弃的异步卸载 block |
+| `vllm:agent_kv_fallbacks` | Counter | 按受控原因统计原生回退 |
+| `vllm:agent_kv_cursor_resets` | Counter | 按受控原因统计 lazy 扫描游标重置 |
+| `vllm:agent_kv_policy_revisions` | Counter | 统计策略状态版本变化 |
+| `vllm:agent_kv_sessions` | Gauge | 当前跟踪的 session 数量 |
+| `vllm:agent_kv_generations` | Gauge | 当前跟踪的 generation 数量 |
+| `vllm:agent_kv_owned_hashes` | Gauge | 当前存在 AgentKV owner 的内容哈希数量 |
+| `vllm:agent_kv_inflight_store_blocks` | Gauge | AgentKV 管理的在途低层 store block 数量 |
+
+这些指标不使用 session、event、branch、request、namespace 或其他上游身份作为 Prometheus
+label，避免无界基数和租户信息泄露。正式 dashboard 与告警阈值仍需结合真实 workload 定义。
+
 ## 当前限制
 
-- 生命周期 endpoint 仅在 `VLLM_SERVER_DEV_MODE=1` 下提供；
+- AgentKV 默认关闭，必须显式设置 `VLLM_ENABLE_AGENT_KV=1`；
+- 生命周期 endpoint 仅在实验开关开启且 `VLLM_SERVER_DEV_MODE=1` 时提供；
 - endpoint 尚未内置生产级身份认证、授权、限流和审计；
 - 分层动作只接入 `SimpleCPUOffloadConnector` 的 lazy 模式；
 - 当前没有主动预取；`prefetch_allowed` 只是前向兼容的业务 hint；
 - `KEEP` 不预留固定 GPU 容量，也不保证永不驱逐；
 - `DROP` 不主动扫描并立即删除块，只阻止创建新的低层副本；
 - AgentKV 只决定是否向低层 admission，低层内部 victim 仍使用 connector 原生策略；
-- 当前没有 Prometheus 指标和正式的低基数统计面板；
+- 已提供低基数 Prometheus 指标，但还没有正式 dashboard 与告警阈值；
 - data parallel 部署还没有 session-affine routing；
 - controller 状态当前在 scheduler 进程内存中，不是跨实例持久化控制面；
 - 服务重启后上游需要通过新请求和事件重新建立所需状态；
@@ -528,21 +572,7 @@ git diff --check
 
 ## 路线图
 
-### 下一步：可观测性与安全开关
-
-计划优先增加低基数指标，且禁止把 session、event、branch 或 request 身份放入
-Prometheus label：
-
-- lifecycle event 的接收、接受、重复和过期数量；
-- `DEFAULT/KEEP/OFFLOAD/DROP` 动作数量；
-- offload 成功、异步失效、容量不足和原生回退数量；
-- policy revision 变化和 cursor 重扫次数；
-- 当前 session、generation、owner hash 和在途 store 的聚合数量；
-- 未启用 AgentKV 时的调度开销基线。
-
-同时增加显式实验开关、配置校验和生产端点保护方式。
-
-### 然后：端到端与性能验证
+### 下一步：端到端与性能验证
 
 - 从 HTTP 请求身份到 cache ownership 的端到端测试；
 - `SUSPEND -> OFFLOAD -> cache hit load` 完整流程；

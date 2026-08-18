@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         AgentKVActionPolicyEnabled,
         AgentKVActionValidator,
     )
+    from vllm.v1.agent_kv.metrics import AgentKVMetrics
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -242,10 +243,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         planner: "AgentKVActionPlanner",
         validator: "AgentKVActionValidator",
         enabled: "AgentKVActionPolicyEnabled",
+        metrics: "AgentKVMetrics | None" = None,
     ) -> None:
         if self.scheduler_manager is not None:
             self.scheduler_manager.bind_agent_kv_action_policy(
-                planner, validator, enabled
+                planner, validator, enabled, metrics
             )
 
     def get_num_new_matched_tokens(

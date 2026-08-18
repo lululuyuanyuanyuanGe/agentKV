@@ -60,5 +60,10 @@ class AgentKVOwnershipIndex:
     def get_hashes(self, owner: AgentKVGenerationKey) -> frozenset[bytes]:
         return frozenset(self._hashes_by_owner.get(owner, ()))
 
+    @property
+    def num_hashes(self) -> int:
+        """Return the number of distinct content hashes with owners."""
+        return len(self._owners_by_hash)
+
     def __bool__(self) -> bool:
         return bool(self._owners_by_hash)

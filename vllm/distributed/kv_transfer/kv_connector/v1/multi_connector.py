@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         AgentKVActionPolicyEnabled,
         AgentKVActionValidator,
     )
+    from vllm.v1.agent_kv.metrics import AgentKVMetrics
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -270,9 +271,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         planner: "AgentKVActionPlanner",
         validator: "AgentKVActionValidator",
         enabled: "AgentKVActionPolicyEnabled",
+        metrics: "AgentKVMetrics | None" = None,
     ) -> None:
         for connector in self._connectors:
-            connector.bind_agent_kv_action_policy(planner, validator, enabled)
+            connector.bind_agent_kv_action_policy(planner, validator, enabled, metrics)
 
     # We must override the base class method here because we need to bind
     # the metadata to each connector in the order of the connectors in the

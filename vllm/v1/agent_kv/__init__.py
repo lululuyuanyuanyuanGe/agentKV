@@ -12,6 +12,7 @@ from vllm.v1.agent_kv.action import (
     plan_agent_kv_cache_actions,
 )
 from vllm.v1.agent_kv.controller import AgentKVController
+from vllm.v1.agent_kv.metrics import AgentKVMetrics, AgentKVStats
 from vllm.v1.agent_kv.ownership import AgentKVGenerationKey
 from vllm.v1.agent_kv.policy import (
     AgentKVCacheBlockCandidate,
@@ -45,8 +46,10 @@ __all__ = [
     "AgentKVEventStatus",
     "AgentKVEventType",
     "AgentKVGenerationKey",
+    "AgentKVMetrics",
     "AgentKVLifecycleState",
     "AgentKVRequestMetadata",
+    "AgentKVStats",
     "AgentKVPolicyOwner",
     "AgentKVPressure",
     "AgentKVPressureLevel",

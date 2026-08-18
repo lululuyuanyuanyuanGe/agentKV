@@ -8,6 +8,11 @@ from vllm.entrypoints.generate.base.agent_kv import (
 )
 
 
+@pytest.fixture(autouse=True)
+def enable_agent_kv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_AGENT_KV", "1")
+
+
 def parse_metadata(
     *,
     session_id: str | None = None,
@@ -22,6 +27,23 @@ def parse_metadata(
 
 
 def test_agent_kv_metadata_is_opt_in() -> None:
+    assert parse_metadata(session_id="session-a") is None
+
+
+def test_agent_kv_metadata_requires_explicit_enable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_AGENT_KV", "0")
+
+    with pytest.raises(ValueError, match="VLLM_ENABLE_AGENT_KV=1"):
+        parse_metadata(
+            session_id="session-a",
+            headers={
+                "X-AgentKV-Namespace": "tenant-a",
+                "X-AgentKV-Generation": "1",
+            },
+        )
+
     assert parse_metadata(session_id="session-a") is None
 
 

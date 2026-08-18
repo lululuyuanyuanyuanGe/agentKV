@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from vllm.v1.agent_kv.metrics import AgentKVStats
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import (
@@ -43,6 +44,30 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
     assert decoded.scheduler_stats.iteration_details == iteration_details
+
+
+def test_agent_kv_stats_serialization() -> None:
+    agent_kv_stats = AgentKVStats(
+        event_counts={"SUSPEND": {"accepted": 2}},
+        action_counts={"offload": {"suspended": 4}},
+        offload_result_counts={"accepted": 3, "invalidated": 1},
+        fallback_counts={"action_plan_error": 1},
+        cursor_reset_counts={"policy_revision": 2},
+        policy_revisions=5,
+        num_sessions=7,
+        num_generations=8,
+        num_owned_hashes=9,
+        num_inflight_store_blocks=10,
+    )
+    outputs = EngineCoreOutputs(
+        scheduler_stats=SchedulerStats(agent_kv_stats=agent_kv_stats)
+    )
+
+    encoded = MsgpackEncoder().encode(outputs)
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(encoded)
+
+    assert decoded.scheduler_stats is not None
+    assert decoded.scheduler_stats.agent_kv_stats == agent_kv_stats
 
 
 def test_compute_iteration_details_includes_encoder_stats():
