@@ -19,6 +19,12 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.utils.hashing import sha256
+from vllm.v1.agent_kv.controller import AgentKVController
+from vllm.v1.agent_kv.protocol import (
+    AgentKVEvent,
+    AgentKVEventType,
+    AgentKVRequestMetadata,
+)
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
@@ -303,6 +309,18 @@ def get_cpu_free_blocks(scheduler: SimpleCPUOffloadScheduler) -> int:
     return scheduler.cpu_block_pool.get_num_free_blocks()
 
 
+def bind_agent_kv_controller(
+    scheduler: SimpleCPUOffloadScheduler,
+    controller: AgentKVController,
+) -> None:
+    scheduler.bind_agent_kv_action_policy(
+        controller.plan_cache_actions,
+        controller.validate_cache_action,
+        controller.has_cache_owners,
+        controller.metrics,
+    )
+
+
 def _allocate_gpu_blocks(
     gpu_block_pool: BlockPool,
     request: Request,
@@ -478,6 +496,9 @@ def test_lazy_store_and_load_roundtrip() -> None:
     fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
     sched = fix.scheduler
     gpu_pool = fix.gpu_block_pool
+    # Production always binds the controller. With no owners, it must leave
+    # the native lazy path byte-for-byte equivalent in behavior.
+    bind_agent_kv_controller(sched, AgentKVController())
 
     num_blocks = 2
 
@@ -526,11 +547,181 @@ def test_lazy_store_and_load_roundtrip() -> None:
     sched.update_state_after_alloc(
         req_old2, kv_blocks_load, num_external_tokens=hit_tokens
     )
-
     sched_out2 = make_scheduler_output({req_old2.request_id: 1})
     meta2 = sched.build_connector_meta(sched_out2)
     assert meta2.load_event >= 0, "Expected a load event to be assigned"
     assert len(meta2.load_gpu_blocks) > 0
+
+
+def test_agent_kv_discards_lazy_offload_invalidated_by_resume() -> None:
+    """A resumed generation must not publish an obsolete offload result."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    controller = AgentKVController()
+    bind_agent_kv_controller(sched, controller)
+
+    request = make_request(num_blocks=2, request_id="agent-kv-suspended")
+    blocks = _allocate_gpu_blocks(gpu_pool, request, 2, group_id=0)
+    gpu_pool.free_blocks(blocks)
+    controller.register_request(
+        AgentKVRequestMetadata(
+            namespace="tenant",
+            session_id="session",
+            branch_id="main",
+            generation=1,
+        ),
+        request.request_id,
+    )
+    controller.finish_request(request.request_id, request.block_hashes)
+    controller.apply_event(
+        AgentKVEvent(
+            event_id="suspend",
+            event_sequence=1,
+            event_type=AgentKVEventType.SUSPEND,
+            emitted_at_ms=1_000,
+            namespace="tenant",
+            session_id="session",
+            branch_id="main",
+            generation=1,
+        )
+    )
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 2
+    planned_stats = controller.drain_metrics()
+    assert planned_stats is not None
+    assert planned_stats.action_counts == {"offload": {"suspended": 2}}
+    assert planned_stats.num_inflight_store_blocks == 2
+
+    controller.apply_event(
+        AgentKVEvent(
+            event_id="resume",
+            event_sequence=2,
+            event_type=AgentKVEventType.RESUME_PENDING,
+            emitted_at_ms=2_000,
+            namespace="tenant",
+            session_id="session",
+            branch_id="main",
+            generation=1,
+        )
+    )
+    simulate_store_completion(sched, meta.store_event)
+    completed_stats = controller.drain_metrics()
+    assert completed_stats is not None
+    assert completed_stats.offload_result_counts == {"invalidated": 2}
+    assert completed_stats.num_inflight_store_blocks == 0
+
+    for block_hash in request.block_hashes:
+        cache_key = make_block_hash_with_group_id(block_hash, 0)
+        assert (
+            sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(cache_key)
+            is None
+        )
+    gpu_pool.free_blocks(fillers)
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_store_blocks"),
+    [
+        (None, 0),
+        (AgentKVEventType.SUSPEND, 2),
+        (AgentKVEventType.GENERATION_EXPIRED, 0),
+    ],
+)
+def test_agent_kv_routes_lazy_store_by_lifecycle(
+    event_type: AgentKVEventType | None,
+    expected_store_blocks: int,
+) -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    controller = AgentKVController()
+    bind_agent_kv_controller(sched, controller)
+
+    request = make_request(num_blocks=2)
+    blocks = _allocate_gpu_blocks(gpu_pool, request, 2, group_id=0)
+    gpu_pool.free_blocks(blocks)
+    controller.register_request(
+        AgentKVRequestMetadata(
+            namespace="tenant",
+            session_id="routed-session",
+            branch_id="main",
+            generation=1,
+        ),
+        request.request_id,
+    )
+    controller.finish_request(request.request_id, request.block_hashes)
+    if event_type is not None:
+        controller.apply_event(
+            AgentKVEvent(
+                event_id=event_type.value,
+                event_sequence=1,
+                event_type=event_type,
+                emitted_at_ms=1_000,
+                namespace="tenant",
+                session_id="routed-session",
+                branch_id="main",
+                generation=1,
+            )
+        )
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+
+    assert len(meta.store_gpu_blocks) == expected_store_blocks
+    if expected_store_blocks:
+        simulate_store_completion(sched, meta.store_event)
+    gpu_pool.free_blocks(fillers)
+
+
+def test_agent_kv_state_change_restarts_lazy_scan() -> None:
+    """A state revision must revisit blocks skipped by an earlier KEEP."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    controller = AgentKVController()
+    bind_agent_kv_controller(sched, controller)
+
+    request = make_request(num_blocks=2)
+    blocks = _allocate_gpu_blocks(gpu_pool, request, 2, group_id=0)
+    gpu_pool.free_blocks(blocks)
+    controller.register_request(
+        AgentKVRequestMetadata(
+            namespace="tenant",
+            session_id="reconsider-session",
+            branch_id="main",
+            generation=1,
+        ),
+        request.request_id,
+    )
+    controller.finish_request(request.request_id, request.block_hashes)
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+
+    active_meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert not active_meta.store_gpu_blocks
+
+    controller.apply_event(
+        AgentKVEvent(
+            event_id="suspend-after-keep",
+            event_sequence=1,
+            event_type=AgentKVEventType.SUSPEND,
+            emitted_at_ms=1_000,
+            namespace="tenant",
+            session_id="reconsider-session",
+            branch_id="main",
+            generation=1,
+        )
+    )
+
+    suspended_meta = sched.build_connector_meta(make_scheduler_output({}))
+
+    assert len(suspended_meta.store_gpu_blocks) == 2
+    simulate_store_completion(sched, suspended_meta.store_event)
+    gpu_pool.free_blocks(fillers)
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.agent_kv.protocol import AgentKVRequestMetadata
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -78,6 +79,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -184,7 +186,13 @@ class Request:
         self.all_token_ids = ConstantList(self._all_token_ids)
         # trace_headers
         self.trace_headers = trace_headers
+        if agent_kv_metadata is not None:
+            if session_id is None:
+                session_id = agent_kv_metadata.session_id
+            elif session_id != agent_kv_metadata.session_id:
+                raise ValueError("session_id must match agent_kv_metadata.session_id")
         self.session_id = session_id
+        self.agent_kv_metadata = agent_kv_metadata
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
@@ -244,6 +252,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             session_id=request.session_id,
+            agent_kv_metadata=request.agent_kv_metadata,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,

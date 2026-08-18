@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
+from vllm.v1.agent_kv.metrics import AgentKVStats
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
@@ -566,6 +567,66 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
+        )
+
+        #
+        # AgentKV lifecycle policy
+        #
+        self.counter_agent_kv_events = self._counter_cls(
+            name="vllm:agent_kv_events",
+            documentation="AgentKV lifecycle events by type and result.",
+            labelnames=labelnames + ["event_type", "status"],
+        )
+        self.counter_agent_kv_actions = self._counter_cls(
+            name="vllm:agent_kv_cache_actions",
+            documentation="AgentKV cache action plans by action and reason.",
+            labelnames=labelnames + ["action", "reason"],
+        )
+        self.counter_agent_kv_offload_results = self._counter_cls(
+            name="vllm:agent_kv_offload_results",
+            documentation="AgentKV offload blocks by completion result.",
+            labelnames=labelnames + ["result"],
+        )
+        self.counter_agent_kv_fallbacks = self._counter_cls(
+            name="vllm:agent_kv_fallbacks",
+            documentation="AgentKV native fallbacks by bounded reason.",
+            labelnames=labelnames + ["reason"],
+        )
+        self.counter_agent_kv_cursor_resets = self._counter_cls(
+            name="vllm:agent_kv_cursor_resets",
+            documentation="AgentKV lazy scan cursor resets by reason.",
+            labelnames=labelnames + ["reason"],
+        )
+        counter_agent_kv_policy_revisions = self._counter_cls(
+            name="vllm:agent_kv_policy_revisions",
+            documentation="AgentKV lifecycle policy revision changes.",
+            labelnames=labelnames,
+        )
+        self.counter_agent_kv_policy_revisions = create_metric_per_engine(
+            counter_agent_kv_policy_revisions, per_engine_labelvalues
+        )
+
+        def make_agent_kv_gauge(name: str, documentation: str) -> dict[int, Gauge]:
+            metric = self._gauge_cls(
+                name=name,
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            return create_metric_per_engine(metric, per_engine_labelvalues)
+
+        self.gauge_agent_kv_sessions = make_agent_kv_gauge(
+            "vllm:agent_kv_sessions", "Tracked AgentKV sessions."
+        )
+        self.gauge_agent_kv_generations = make_agent_kv_gauge(
+            "vllm:agent_kv_generations", "Tracked AgentKV generations."
+        )
+        self.gauge_agent_kv_owned_hashes = make_agent_kv_gauge(
+            "vllm:agent_kv_owned_hashes", "Content hashes with AgentKV owners."
+        )
+        self.gauge_agent_kv_inflight_store_blocks = make_agent_kv_gauge(
+            "vllm:agent_kv_inflight_store_blocks",
+            "AgentKV-governed blocks in asynchronous lower-tier stores.",
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1122,6 +1183,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
 
+            if scheduler_stats.agent_kv_stats is not None:
+                self._record_agent_kv_stats(scheduler_stats.agent_kv_stats, engine_idx)
+
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
             )
@@ -1257,6 +1321,38 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+
+    def _record_agent_kv_stats(
+        self,
+        stats: AgentKVStats,
+        engine_idx: int,
+    ) -> None:
+        labelvalues = self.per_engine_labelvalues[engine_idx]
+        for event_type, status_counts in stats.event_counts.items():
+            for status, count in status_counts.items():
+                self.counter_agent_kv_events.labels(
+                    *labelvalues, event_type, status
+                ).inc(count)
+        for action, reason_counts in stats.action_counts.items():
+            for reason, count in reason_counts.items():
+                self.counter_agent_kv_actions.labels(*labelvalues, action, reason).inc(
+                    count
+                )
+        for result, count in stats.offload_result_counts.items():
+            self.counter_agent_kv_offload_results.labels(*labelvalues, result).inc(
+                count
+            )
+        for reason, count in stats.fallback_counts.items():
+            self.counter_agent_kv_fallbacks.labels(*labelvalues, reason).inc(count)
+        for reason, count in stats.cursor_reset_counts.items():
+            self.counter_agent_kv_cursor_resets.labels(*labelvalues, reason).inc(count)
+        self.counter_agent_kv_policy_revisions[engine_idx].inc(stats.policy_revisions)
+        self.gauge_agent_kv_sessions[engine_idx].set(stats.num_sessions)
+        self.gauge_agent_kv_generations[engine_idx].set(stats.num_generations)
+        self.gauge_agent_kv_owned_hashes[engine_idx].set(stats.num_owned_hashes)
+        self.gauge_agent_kv_inflight_store_blocks[engine_idx].set(
+            stats.num_inflight_store_blocks
+        )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

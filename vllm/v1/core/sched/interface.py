@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.config.kv_events import KVEventsConfig
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.v1.agent_kv.protocol import AgentKVEvent
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -220,6 +221,15 @@ class SchedulerInterface(ABC):
                 taking KV cache.
         """
         raise NotImplementedError
+
+    def apply_agent_kv_event(self, event: "AgentKVEvent") -> dict[str, object]:
+        """Apply an AgentKV lifecycle event.
+
+        Custom schedulers may override this optional experimental hook.
+        """
+        raise NotImplementedError(
+            "AgentKV lifecycle events are not supported by this scheduler"
+        )
 
     @abstractmethod
     def reset_encoder_cache(self) -> None:

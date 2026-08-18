@@ -62,6 +62,12 @@ if TYPE_CHECKING:
         PromMetricT,
     )
     from vllm.forward_context import ForwardContext
+    from vllm.v1.agent_kv.action import (
+        AgentKVActionPlanner,
+        AgentKVActionPolicyEnabled,
+        AgentKVActionValidator,
+    )
+    from vllm.v1.agent_kv.metrics import AgentKVMetrics
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -469,6 +475,16 @@ class KVConnectorBase_V1(ABC):
         Args:
             gpu_block_pool: the GPU block pool.
         """
+        return
+
+    def bind_agent_kv_action_policy(
+        self,
+        planner: "AgentKVActionPlanner",
+        validator: "AgentKVActionValidator",
+        enabled: "AgentKVActionPolicyEnabled",
+        metrics: "AgentKVMetrics | None" = None,
+    ) -> None:
+        """Bind optional AgentKV tier actions to a compatible connector."""
         return
 
     @abstractmethod

@@ -104,6 +104,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
+from vllm.v1.agent_kv.protocol import AgentKVRequestMetadata
 
 logger = init_logger(__name__)
 
@@ -452,6 +453,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 else await self._get_trace_headers(raw_request.headers)
             )
             session_id = self._get_session_id(request, raw_request)
+            agent_kv_metadata = self._get_agent_kv_metadata(
+                request, raw_request, session_id
+            )
 
             chat_template_kwargs = self._effective_chat_template_kwargs(request)
             response_parser = self._make_response_parser(
@@ -518,6 +522,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 priority=self._get_priority(request, raw_request),
                 trace_headers=trace_headers,
                 session_id=session_id,
+                agent_kv_metadata=agent_kv_metadata,
                 reasoning_parser_kwargs=reasoning_parser_kwargs
                 if self.parser and self.parser.reasoning_parser_cls is not None
                 else None,
@@ -672,6 +677,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
+        agent_kv_metadata: AgentKVRequestMetadata | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
     ):
         max_model_len = self.model_config.max_model_len
@@ -697,6 +703,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 trace_headers=trace_headers,
                 priority=priority,
                 session_id=session_id,
+                agent_kv_metadata=agent_kv_metadata,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
 

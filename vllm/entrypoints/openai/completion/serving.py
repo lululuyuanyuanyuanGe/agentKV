@@ -195,6 +195,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 else await self._get_trace_headers(raw_request.headers)
             )
             session_id = self._get_session_id(request, raw_request)
+            agent_kv_metadata = self._get_agent_kv_metadata(
+                request, raw_request, session_id
+            )
 
             if isinstance(sampling_params, BeamSearchParams):
                 generator = self.beam_search(
@@ -204,6 +207,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     lora_request=lora_request,
                     trace_headers=trace_headers,
                     session_id=session_id,
+                    agent_kv_metadata=agent_kv_metadata,
                 )
             else:
                 generator = self.engine_client.generate(
@@ -215,6 +219,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    agent_kv_metadata=agent_kv_metadata,
                 )
 
             generators.append(generator)

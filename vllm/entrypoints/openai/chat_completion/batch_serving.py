@@ -175,6 +175,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 else await self._get_trace_headers(raw_request.headers)
             )
             session_id = self._get_session_id(single_request, raw_request)
+            agent_kv_metadata = self._get_agent_kv_metadata(
+                single_request, raw_request, session_id
+            )
             generators.append(
                 self.engine_client.generate(
                     engine_prompt,
@@ -185,6 +188,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    agent_kv_metadata=agent_kv_metadata,
                     reasoning_ended=None,
                 )
             )

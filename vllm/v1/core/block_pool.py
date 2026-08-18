@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
-from typing import Any
+import itertools
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -28,6 +30,28 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class FreeCachedBlockSnapshot:
+    """Content identity of one cached block in the free queue."""
+
+    block_id: int
+    cache_keys: tuple[bytes, ...]
+    content_hashes: tuple[bytes, ...]
+
+
+class FreeCachedBlockTarget(Protocol):
+    """Minimum target contract accepted by the block pool."""
+
+    block_id: int
+    expected_cache_keys: tuple[bytes, ...]
+
+
+FreeCachedBlockEvictionPlanner = Callable[
+    [Sequence[FreeCachedBlockSnapshot], int],
+    Sequence[FreeCachedBlockTarget],
+]
 
 
 class BlockHashToBlockMap:
@@ -194,6 +218,21 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self._free_cached_block_eviction_planner: (
+            FreeCachedBlockEvictionPlanner | None
+        ) = None
+        self._free_cached_block_eviction_planner_enabled: Callable[[], bool] | None = (
+            None
+        )
+
+    def set_free_cached_block_eviction_planner(
+        self,
+        planner: FreeCachedBlockEvictionPlanner,
+        enabled: Callable[[], bool],
+    ) -> None:
+        """Install an optional application-aware free-block ordering hook."""
+        self._free_cached_block_eviction_planner = planner
+        self._free_cached_block_eviction_planner_enabled = enabled
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -658,6 +697,8 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        self._apply_free_cached_block_eviction_planner(num_blocks)
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
@@ -675,6 +716,129 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def _apply_free_cached_block_eviction_planner(self, num_blocks: int) -> None:
+        planner = self._free_cached_block_eviction_planner
+        enabled = self._free_cached_block_eviction_planner_enabled
+        if (
+            not self.enable_caching
+            or num_blocks <= 0
+            or planner is None
+            or enabled is None
+            or not enabled()
+        ):
+            return
+
+        num_at_risk_blocks = sum(
+            bool(self._get_block_cache_keys(block))
+            for block in itertools.islice(
+                self.free_block_queue.iter_blocks_after(None), num_blocks
+            )
+        )
+        if num_at_risk_blocks == 0:
+            return
+
+        try:
+            candidates = self.get_free_cached_block_snapshots()
+            targets = planner(candidates, num_at_risk_blocks)
+        except Exception:
+            logger.exception(
+                "Free cached block eviction planner failed; using native order"
+            )
+            return
+        self.prioritize_free_cached_blocks_for_eviction(targets)
+
+    def _get_block_cache_keys(self, block: KVCacheBlock) -> tuple[bytes, ...]:
+        cache_keys: set[bytes] = set()
+        if block.block_hash is not None:
+            cache_keys.add(bytes(block.block_hash))
+        cache_keys.update(
+            bytes(cache_key)
+            for cache_key in self.cached_block_hashes_by_block.get(block.block_id, ())
+        )
+        return tuple(sorted(cache_keys))
+
+    def get_free_cached_block_snapshots(
+        self,
+    ) -> tuple[FreeCachedBlockSnapshot, ...]:
+        """Snapshot cached eviction candidates in their native order."""
+        snapshots = []
+        for block in self.free_block_queue.get_all_free_blocks():
+            if snapshot := self.get_free_cached_block_snapshot(block.block_id):
+                snapshots.append(snapshot)
+        return tuple(snapshots)
+
+    def get_free_cached_block_snapshot(
+        self,
+        block_id: int,
+    ) -> FreeCachedBlockSnapshot | None:
+        """Snapshot one cached block only while it remains in the free queue."""
+        if not 0 <= block_id < len(self.blocks):
+            return None
+        block = self.blocks[block_id]
+        if (
+            block.ref_cnt != 0
+            or block.is_null
+            or block.prev_free_block is None
+            or block.next_free_block is None
+        ):
+            return None
+        cache_keys = self._get_block_cache_keys(block)
+        if not cache_keys:
+            return None
+        return FreeCachedBlockSnapshot(
+            block_id=block.block_id,
+            cache_keys=cache_keys,
+            content_hashes=tuple(
+                sorted({bytes(get_block_hash(key)) for key in cache_keys})
+            ),
+        )
+
+    def prioritize_free_cached_blocks_for_eviction(
+        self,
+        targets: Sequence[FreeCachedBlockTarget],
+    ) -> int:
+        """Move still-valid targets to the cached eviction queue front.
+
+        Each target is checked against its exact cache keys before mutation.
+        This prevents a plan from affecting a block identifier that has been
+        reused or whose partial-cache aliases changed since the snapshot.
+        """
+        valid_blocks: list[KVCacheBlock] = []
+        seen_block_ids: set[int] = set()
+        for target in targets:
+            if target.block_id in seen_block_ids:
+                continue
+            seen_block_ids.add(target.block_id)
+            if not 0 <= target.block_id < len(self.blocks):
+                continue
+            block = self.blocks[target.block_id]
+            if (
+                block.ref_cnt != 0
+                or block.is_null
+                or block.prev_free_block is None
+                or block.next_free_block is None
+                or self._get_block_cache_keys(block)
+                != tuple(target.expected_cache_keys)
+            ):
+                continue
+            valid_blocks.append(block)
+
+        for block in valid_blocks:
+            self.free_block_queue.remove(block)
+        if not valid_blocks:
+            return 0
+
+        reference = self.free_block_queue.fake_free_list_head.next_free_block
+        assert reference is not None
+        while (
+            reference is not self.free_block_queue.fake_free_list_tail
+            and reference.block_hash is None
+        ):
+            assert reference.next_free_block is not None
+            reference = reference.next_free_block
+        self.free_block_queue.insert_before(reference, valid_blocks)
+        return len(valid_blocks)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """

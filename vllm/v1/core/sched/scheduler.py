@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -31,6 +32,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.agent_kv.controller import AgentKVController
+from vllm.v1.agent_kv.protocol import AgentKVEvent
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -87,6 +90,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
+        self.agent_kv_controller = AgentKVController(enabled=envs.VLLM_ENABLE_AGENT_KV)
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -275,10 +279,20 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        self.kv_cache_manager.block_pool.set_free_cached_block_eviction_planner(
+            self.agent_kv_controller.plan_evictions,
+            self.agent_kv_controller.has_cache_owners,
+        )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            self.connector.bind_agent_kv_action_policy(
+                self.agent_kv_controller.plan_cache_actions,
+                self.agent_kv_controller.validate_cache_action,
+                self.agent_kv_controller.has_cache_owners,
+                self.agent_kv_controller.metrics,
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -2255,6 +2269,10 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if request.agent_kv_metadata is not None:
+                self.agent_kv_controller.register_request(
+                    request.agent_kv_metadata, request.request_id
+                )
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -2329,6 +2347,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self.agent_kv_controller.finish_request(
+            request.request_id, request.block_hashes
+        )
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2446,6 +2467,10 @@ class Scheduler(SchedulerInterface):
             )
         )
 
+    def apply_agent_kv_event(self, event: AgentKVEvent) -> dict[str, object]:
+        """Apply lifecycle metadata used by AgentKV cache policy hooks."""
+        return self.agent_kv_controller.apply_event(event)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -2552,6 +2577,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
+            agent_kv_stats=self.agent_kv_controller.drain_metrics(),
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )

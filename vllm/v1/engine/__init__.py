@@ -16,6 +16,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.agent_kv.protocol import AgentKVRequestMetadata
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
@@ -146,6 +147,7 @@ class EngineCoreRequest(
     abort_immediately: bool = False
 
     session_id: str | None = None
+    agent_kv_metadata: AgentKVRequestMetadata | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
